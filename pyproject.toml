@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pokergpu"
+version = "0.1.0"
+description = "Massively parallel GPU-accelerated Heads-Up No-Limit Hold'em environment"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "warp-lang>=1.10.1",
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "torchrl>=0.10.1",
+    "hydra-core>=1.3.2",
+    "tqdm>=4.67.1",
+    "tensorboard>=2.20.0",
+    "nvidia-ml-py>=13.590.48",
+    "ruff>=0.14.8",
+    "rich>=13.0.0",
+    "mlflow[mcp]>=3.5.1",
+    "python-dotenv>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "line-profiler>=5.0.0",
+    "memory-profiler>=0.61.0",
+    "nvtx>=0.2.14",
+    "onnx>=1.21.0",
+    "onnxruntime>=1.24.3",
+    "onnxscript>=0.7.0",
+    "pytest>=9.0.2",
+    "pytest-cov>=4.1.0",
+    "pytest-xdist>=3.8.0",
+    "requests>=2.34.2",
+    "ruff>=0.1.0",
+    "scalene>=2.1.0",
+    "treys>=0.1.8",
+    "ty>=0.0.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Allow unused imports in __init__.py
+"bench/profile_training.py" = ["SIM117"]  # Nested profiling contexts produce separate timings.
+"play/interactive.py" = ["E402"]  # Script adjusts sys.path before local imports.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --strict-markers --tb=short --assert=plain"
+
+[tool.coverage.run]
+source = ["src/gpu_poker"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true

@@ -1,0 +1,173 @@
+# AlphaStar triad config for V100 (16GB SXM2, sm_70).
+# Run with: uv run python train/train.py --config-name=train_triad_v100
+#
+# Sized to fit comfortably on a single V100 with the transformer backbone:
+#   - num_envs=98304: 60/20/20 partition -> 58982 M / 19660 ME / 19662 LE
+#     each role's PPO buffer is ~7.5 GB at fp32 (T=64, scalar_dim~=17,
+#     STATE_WIDTH=129, NUM_ACTIONS=4, transformer history).
+#   - transformer policy_backbone (research-report task I), spec-default
+#     dims (d_model=256, n_layers=4, n_heads=4, ffn=1024 ~ 3.3M params/net).
+#   - AMP fp16 (V100 is sm_70, no bf16 Tensor Core acceleration).
+#   - league_enabled=true so the unified opponent pool / PFSP wiring is
+#     active; cfg.triad_enabled=true tells run() to dispatch to
+#     _run_impl_triad which manages opponents via TriadController.
+
+device: cuda:0
+num_envs: 98304
+rollout_steps: 64
+starting_stack: 20000
+starting_stack_min: 4000
+starting_stack_max: 20000
+small_blind: 50
+big_blind: 100
+total_env_steps: 4000000000
+num_updates: 0
+
+# Per-role lr inherits this unless overridden via triad_lr_{main,me,le}.
+lr: 3.0e-4
+gamma: 0.99
+gae_lambda: 0.95
+clip_eps: 0.2
+value_coef: 0.5
+entropy_coef: 0.05
+max_grad_norm: 1.0
+
+# Transformer policy (task I) -- ~3.3M params per net, x3 nets ~ 10M.
+policy_backbone: transformer
+transformer_d_model: 256
+transformer_n_heads: 4
+transformer_n_layers: 4
+transformer_ffn_dim: 1024
+
+# LSTM knobs (ignored when policy_backbone=transformer).
+card_embed_dim: 96
+mlp_dim: 384
+torso_layers: 4
+lstm_hidden: 384
+head_layers: 3
+head_dim: null
+
+# PPO update sizing -- minibatch must evenly divide num_envs * rollout_steps.
+# 98304 * 64 = 6_291_456 samples per rollout. mb=98304 => 64 minibatches.
+num_epochs: 4
+minibatch_size: 98304
+seed: 42
+
+# Logging cadence -- ~12s at 420k SPS on V100.
+log_every_env_steps: 5000000
+log_every_seconds: 1.0
+
+checkpoint_dir: global_league_triad/checkpoints
+save_every_env_steps: 100000000
+resume_from: ""
+
+# Eval (legacy single-net path knobs; triad uses its own eval cadence).
+eval_every: 40
+eval_hands: 5000
+eval_max_steps: 5000000
+
+# League pool wiring (the triad reuses UnifiedOpponentPool for snapshots).
+league_enabled: true
+league_eta_selfplay: 0.6
+league_bot_initial_score: 0.0
+league_eval_bots: false           # triad doesn't train on bots
+league_eval_bots_every: 100
+league_snapshot_pool: 32          # legacy field; triad uses triad_*_pool_cap
+league_snapshot_every_updates: 20
+league_eval_every_updates: 50
+league_eval_hands: 5000
+league_eval_subset: 8
+league_eval_deterministic: false
+league_eval_seat_swap: true
+league_pfsp_temperature: 1.0
+league_pfsp_epsilon: 1.0e-3
+league_pfsp_mode: hard
+league_pfsp_q: 2.0
+league_train_on_bots: false
+league_rollout_snapshot_k: 4
+
+selfplay_eval_enabled: true
+selfplay_eval_every_updates: 50
+selfplay_eval_hands: 5000
+selfplay_eval_subset: 8
+selfplay_eval_deterministic: false
+selfplay_eval_seat_swap: true
+
+timing_sync: true
+
+# torch.compile interacts poorly with mutate_after_snapshot (ME/LE
+# weight swaps). Disabled in the triad path; the per-role nets are
+# small enough that the compile speedup is marginal.
+compile_policy: false
+
+# V100 (sm_70) has no native bf16 acceleration; force fp16.
+use_amp: true
+amp_dtype: float16
+
+autotune: false
+use_cuda_graph: false             # not compatible with league/triad
+
+# =================== AlphaStar triad (G) =====================================
+triad_enabled: true
+
+# Env partition. Sums to 1.0.
+triad_main_frac: 0.6
+triad_me_frac: 0.2
+triad_le_frac: 0.2
+
+# Snapshot/promotion cadence.
+triad_main_snapshot_every: 25
+triad_me_promote_wr: 0.70
+triad_le_promote_wr: 0.70
+triad_le_reset_prob: 0.50
+triad_me_curriculum_threshold: 0.30
+# Force-reset ME from current Main every N updates if WR gate never
+# fires. AlphaStar §3 / Vinyals et al. 2019 reinitialize main exploiters
+# every 50-100 PPO updates regardless of WR -- without this, once Main
+# catches up to ME, ME freezes (wiki/me-exploiter-stalling.md). 0 disables.
+triad_me_force_reset_every: 50
+
+# Async eval (T7 stub uses inline sigmoid proxy; real evals replace later).
+triad_eval_every_updates: 50
+triad_eval_hands: 1000
+
+# Main's opponent mix. Sums to 1.0.
+triad_main_mix_self: 0.35
+triad_main_mix_pfsp: 0.50
+triad_main_mix_forgotten: 0.15
+
+# Pool caps per role. ME=0: snapshots logged but never sampled.
+triad_main_pool_cap: 16
+triad_le_pool_cap: 8
+triad_me_pool_cap: 0
+
+# Per-role hparam overrides (null = inherit globals).
+triad_lr_main: null
+triad_lr_me: null
+triad_lr_le: null
+triad_entropy_me: null
+triad_entropy_le: null
+
+# MLflow tracking (server configured via .env). Off-by-config = no-op.
+mlflow_enabled: true
+mlflow_experiment: null
+mlflow_run_name: null
+# Flat labels surface in the UI as searchable tags (Neptune-style).
+mlflow_tags:
+  - triad
+  - v100
+  - transformer
+mlflow_notes: null
+mlflow_extra_tags: null
+# Opt-in checkpoint upload. Default off so production runs don't pump
+# GBs into MinIO unless explicitly asked. CLI override examples:
+#   mlflow_upload_checkpoints=final     # ~13MB at run end
+#   mlflow_upload_checkpoints=periodic  # final + every save tick
+#   mlflow_upload_checkpoints=all       # periodic + every triad snapshot
+mlflow_upload_checkpoints: none
+
+hydra:
+  run:
+    dir: train/outputs/triad/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true

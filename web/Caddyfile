@@ -1,0 +1,14 @@
+:80 {
+	root * /srv
+	try_files {path} /index.html
+
+	# SvelteKit emits content-hashed assets under /_app/immutable/.
+	@immutable path /_app/immutable/*
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+	# onnxruntime-web ships .wasm blobs — make sure the MIME type is right.
+	@wasm path *.wasm
+	header @wasm Content-Type "application/wasm"
+
+	file_server
+}

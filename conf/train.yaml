@@ -1,0 +1,239 @@
+# Default Hydra config for `train/train.py`
+
+# Override on CLI, e.g. `uv run python train/train.py device=cpu`
+device: cuda:0
+num_envs: 262144
+rollout_steps: 64
+# Game economy. Slumbot-matching default: 50/100 blinds with stacks in
+# [40, 200] BB (4000..20000 chips). Randomizing starting stacks per env
+# teaches the policy stack-depth-aware play (short-stack push/fold, deep-stack
+# 3-bet wars, etc.) instead of overfitting to one specific depth.
+starting_stack: 20000        # used when min==max, and as the autotune sizing reference
+starting_stack_min: 4000     # 40 BB min depth
+starting_stack_max: 20000    # 200 BB max depth
+small_blind: 50
+big_blind: 100
+# Train until this many environment steps are collected.
+# (Each "rollout/update" collects `num_envs * rollout_steps` steps.)
+# ~1 hour target on a 3090 at ~420k env-steps/sec ≈ 1.5e9 env-steps.
+total_env_steps: 4000000000
+# Backward-compat only; set to 0 when using `total_env_steps`.
+num_updates: 0
+
+lr: 3e-4
+gamma: 0.99
+gae_lambda: 0.95
+clip_eps: 0.2
+value_coef: 0.5
+entropy_coef: 0.05
+max_grad_norm: 1.0
+
+# Policy backbone selection.
+#   "lstm"        - original architecture, uses card_embed_dim/mlp_dim/
+#                   torso_layers/lstm_hidden/head_layers/head_dim below.
+#   "transformer" - encoder-only transformer over the public-action token
+#                   sequence. LSTM-shape knobs are ignored; tune via the
+#                   transformer_* fields.
+policy_backbone: lstm
+
+# Transformer-only knobs (active when policy_backbone == "transformer").
+# Spec defaults from the research report: ~3M params, similar capacity to the
+# 384-LSTM stack but better inductive bias for hand-history modeling.
+transformer_d_model: 256
+transformer_n_heads: 4
+transformer_n_layers: 4
+transformer_ffn_dim: 1024
+
+# LSTM-only architecture (increase gradually and watch SPS/KL/entropy/EV).
+# "Best first try" (capacity bump without going extreme):
+card_embed_dim: 96
+mlp_dim: 384
+torso_layers: 4
+lstm_hidden: 384
+# Number of MLP layers applied after the LSTM (before the heads). 0 = linear heads directly.
+head_layers: 3
+# Optional width of the post-LSTM MLP. Leave null to default to `lstm_hidden`.
+head_dim: null
+
+# Keep this small for responsiveness; large values can make a single PPO update take minutes.
+num_epochs: 4
+minibatch_size: 262144
+seed: 42
+# Log every N environment steps (controls tqdm postfix + TB scalar density).
+# Example: at ~420k SPS, 5_000_000 env-steps ≈ 12s.
+log_every_env_steps: 5000000
+# `log_every_seconds` controls how often tqdm is refreshed even when env-steps
+# are not advancing (e.g. long PPO update phases); set to ~1.0 for "alive" output.
+log_every_seconds: 1.0
+
+# Checkpoints (gitignored via `checkpoints/`)
+checkpoint_dir: global_league/checkpoints
+save_every_env_steps: 100000000
+# Path to a `.pt` checkpoint produced by this trainer (e.g. `checkpoints/ckpt_env123456_upd7.pt`)
+# Leave empty to start training from scratch.
+resume_from: ""
+
+# Eval (0 disables)
+eval_every: 40
+# Evaluate for at least this many completed hands (more stable than a raw step count).
+eval_hands: 5000
+# Safety cap on env.step calls during eval to avoid pathological long hands.
+eval_max_steps: 5000000
+
+# League / opponent sampling (NFSP-lite)
+# Enabled by default to ensure training sees non-selfplay opponents (bots) and to
+# reduce pathological "self-play only" convergence (e.g. spew lines into stations).
+league_enabled: true
+# Probability the opponent is the latest policy (pure self-play for that env).
+league_eta_selfplay: 0.6
+
+# Initial bb/hand for bots (0 = assume 50% win rate)
+league_bot_initial_score: 0.0
+# Whether to evaluate vs bots for PFSP (updates their weights over time)
+league_eval_bots: true
+# How often to re-evaluate bots (in updates)
+league_eval_bots_every: 100
+# In-memory snapshot pool size (0 disables snapshots).
+league_snapshot_pool: 32
+# Refresh one snapshot slot every N PPO updates (only used when snapshot_pool > 0).
+league_snapshot_every_updates: 20
+# Periodically evaluate learner vs pool members and store results for PFSP sampling.
+league_eval_every_updates: 50
+league_eval_hands: 5000
+# Evaluate only this many snapshots per eval cycle (0 = all).
+league_eval_subset: 8
+# Use stochastic policies for eval (better for mixed strategies).
+league_eval_deterministic: false
+# Evaluate both seat assignments (reduces SB/BB bias) and average.
+league_eval_seat_swap: true
+# PFSP mapping bb/hand -> win-prob uses sigmoid(bb/hand / temperature).
+league_pfsp_temperature: 1.0
+# Adds exploration mass so snapshots are occasionally sampled even if very easy/hard.
+league_pfsp_epsilon: 1e-3
+# PFSP priority function: "hard" = f_hard(p) = (1-p)^q (AlphaStar main-agent
+# default, focuses on opponents you LOSE to). "var" = f_var(p) = p(1-p) (peaks
+# at parity, classic exploiter curriculum). Use "hard" for main-agent training.
+league_pfsp_mode: hard
+league_pfsp_q: 2.0
+# Include scripted bots in the training opponent pool. Per the poker-AI
+# literature (Pluribus, DeepStack, ReBeL, AlphaHoldem), HUNL agents that beat
+# strong humans are all trained by *pure self-play* — scripted bots only ever
+# appear in the eval pipeline. Keeping bots in training overfits the policy to
+# exploitable archetypes (e.g. "never bluff a calling_station") that are
+# anti-curricular against equilibrium-leaning humans.
+league_train_on_bots: false
+# Pool retention policy (top-lab style):
+# - keep a dense window of the most recent snapshots
+# - also keep a sparse set of older snapshots (approximately exponentially spaced)
+# Limit the number of distinct snapshot opponents used for rollouts (performance).
+league_rollout_snapshot_k: 4
+
+# Self-play evaluation vs snapshot pool (stronger than bots).
+# This is an eval-only signal to detect plateaus/cycling; it does not affect training.
+# Requires `league_snapshot_pool > 0` and snapshots being created.
+selfplay_eval_enabled: true
+selfplay_eval_every_updates: 50
+selfplay_eval_hands: 5000
+# Evaluate this many snapshot opponents per eval cycle (0 = all).
+selfplay_eval_subset: 8
+selfplay_eval_deterministic: false
+selfplay_eval_seat_swap: true
+
+# Sync CUDA between phases (collect/opt/eval) so timings are accurate and we don't
+# accidentally build up a huge GPU work queue that later "flushes" as a long stall.
+# This is recommended for stable throughput measurements (set false if you know what you're doing).
+timing_sync: true
+
+# torch.compile() optimization for policy network (PyTorch 2.0+).
+# Uses mode="reduce-overhead" for inference-heavy workloads.
+# First call has compilation overhead; steady-state should be faster.
+compile_policy: true
+
+# Automatic mixed precision (AMP) for faster training on modern GPUs.
+# Uses bfloat16 by default (no loss scaling needed, same exponent range as fp32).
+use_amp: true
+# "auto" picks bf16 on Ampere+ (sm_80+, e.g. 3090/A100/H100), fp16 on older
+# hardware like V100 (sm_70) which has no native bf16 acceleration.
+amp_dtype: auto
+
+# Auto-detect max num_envs that fits in GPU memory (binary search). Override
+# num_envs/minibatch_size before training starts. Use when targeting new hardware.
+autotune: false
+
+# CUDA graphs for PPO update (experimental).
+# Captures the PPO minibatch update as a graph for reduced CPU overhead.
+# Note: Currently not compatible with league_enabled=true.
+# See bench/bench_training_sps.py for benchmarks showing impact.
+use_cuda_graph: false
+
+# =================== AlphaStar triad (G) ====================================
+# When triad_enabled=true, training runs three concurrent agents
+# (Main, Main Exploiter, League Exploiter) on partitioned slices of num_envs.
+# See train/triad.py and the implementation plan for details.
+# Defaults below are the AlphaStar paper values where applicable.
+triad_enabled: false
+
+# Env partition (must sum to 1.0). M gets the largest slice because it's
+# the agent we ship; ME/LE each get a smaller slice for their auxiliary role.
+triad_main_frac: 0.6
+triad_me_frac: 0.2
+triad_le_frac: 0.2
+
+# Snapshot/promotion cadence.
+triad_main_snapshot_every: 25    # M snapshots every K updates regardless of WR
+triad_me_promote_wr: 0.70         # ME snapshots iff WR vs current M >= 0.70
+triad_le_promote_wr: 0.70         # LE snapshots iff WR >= 0.70 vs ALL non-LE
+triad_le_reset_prob: 0.50         # LE: probabilistic random reinit on snapshot
+triad_me_curriculum_threshold: 0.30  # ME falls back to f_var on historicals below this
+
+# Async eval cadence + sample size.
+triad_eval_every_updates: 50
+triad_eval_hands: 1000
+
+# Main's opponent mix (must sum to 1.0). AlphaStar §3 ratios.
+triad_main_mix_self: 0.35
+triad_main_mix_pfsp: 0.50
+triad_main_mix_forgotten: 0.15
+
+# Per-role snapshot pool caps. ME=0: ME snapshots logged but never sampled
+# (they exist only to force M to robustify, then ME resets).
+triad_main_pool_cap: 16
+triad_le_pool_cap: 8
+triad_me_pool_cap: 0
+
+# Per-role hparam overrides. null = inherit the global lr / entropy_coef.
+triad_lr_main: null
+triad_lr_me: null
+triad_lr_le: null
+triad_entropy_me: null
+triad_entropy_le: null
+
+# =================== MLflow tracking ========================================
+# When true (default), training pushes params/metrics/artifacts to the
+# configured MLflow tracking server (see .env). All MLflow calls are wrapped in
+# _safe_mlflow so failures (server down, network blip) only emit a warning
+# and never crash training. Set false to skip MLflow entirely.
+mlflow_enabled: true
+# Override the experiment name (defaults to mlflow_config.DEFAULT_EXPERIMENT).
+mlflow_experiment: null
+# Override the run name (auto-generated when null).
+mlflow_run_name: null
+# Neptune-style flat labels for the UI (each becomes a searchable tag,
+# `tags."label.triad" = "true"`). Example: ["triad", "v100", "ablation"].
+mlflow_tags: null
+# Markdown-rendered run description shown in the UI.
+mlflow_notes: null
+# Arbitrary {key: value} string tags; merged after the auto-tags.
+mlflow_extra_tags: null
+# When + which checkpoints to upload to MLflow. One of:
+#   "none"     -- never upload (.pt stays on local disk only)
+#   "final"    -- one upload at run end (main net's final weights)
+#   "periodic" -- "final" + every save_every_env_steps tick (main net)
+#   "all"      -- "periodic" + every triad snapshot (M/ME/LE) for full provenance
+mlflow_upload_checkpoints: none
+
+hydra:
+  run:
+    dir: train/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true

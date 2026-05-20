@@ -1,0 +1,6 @@
+node_modules/
+tests/fixtures.json
+tests/fixtures.onnx
+
+.svelte-kit/
+build/

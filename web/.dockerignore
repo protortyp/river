@@ -1,0 +1,6 @@
+node_modules
+.svelte-kit
+build
+tests/fixtures.json
+Dockerfile
+.dockerignore

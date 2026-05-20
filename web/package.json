@@ -1,0 +1,24 @@
+{
+  "name": "pokergpu-web",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview",
+    "smoke": "node smoke.mjs",
+    "test": "node tests/encoder.test.mjs && node tests/engine.test.mjs && node --test tests/inference_pushtoken.test.mjs tests/inference_onnx_load.test.mjs"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.20.0",
+    "pokersolver": "^2.1.4"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.60.1",
+    "@sveltejs/vite-plugin-svelte": "^7.1.2",
+    "svelte": "^5.55.7",
+    "vite": "^8.0.13"
+  }
+}
