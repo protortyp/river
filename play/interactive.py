@@ -20,6 +20,7 @@ from pathlib import Path
 
 import torch
 import warp as wp
+from omegaconf import OmegaConf
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -114,31 +115,38 @@ def parse_observation_cards(obs: dict, env_idx: int = 0) -> dict[str, list[int]]
 # ============================================================================
 
 
+ARCH_KEYS = (
+    "card_embed_dim",
+    "mlp_dim",
+    "torso_layers",
+    "lstm_hidden",
+    "head_layers",
+    "head_dim",
+)
+
+
 def load_snapshot_model(
     path: str, device: torch.device, scalar_dim: int, config: dict
 ) -> PokerPolicyNet:
-    """
-    Load a snapshot model from checkpoint.
-    Based on train/train.py:106-125
-    """
+    """Load an LSTM policy snapshot built with the architecture in `config`."""
     ckpt = torch.load(path, map_location=device, weights_only=True)
 
-    # Clean state dict if from compiled model (removes '_orig_mod.' prefix)
+    # torch.compile'd models save parameters under an '_orig_mod.' prefix.
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
 
-    net = PokerPolicyNet(
-        scalar_dim=scalar_dim,
-        card_embed_dim=config.get("card_embed_dim", 64),
-        mlp_dim=config.get("mlp_dim", 256),
-        torso_layers=config.get("torso_layers", 2),
-        lstm_hidden=config.get("lstm_hidden", 256),
-        head_layers=config.get("head_layers", 2),
-        head_dim=config.get("head_dim", 128),
-    ).to(device=device)
+    net = PokerPolicyNet(scalar_dim=scalar_dim, **{k: config[k] for k in ARCH_KEYS}).to(
+        device=device
+    )
 
     net.load_state_dict(state_dict)
     net.eval()
     return net
+
+
+def training_arch_config() -> dict:
+    """Model architecture from the training config, which snapshots are built with."""
+    conf = OmegaConf.load(project_root / "conf" / "train.yaml")
+    return {k: conf[k] for k in ARCH_KEYS}
 
 
 def load_latest_snapshot(pool_dir: Path, device: torch.device, scalar_dim: int) -> tuple:
@@ -166,18 +174,8 @@ def load_latest_snapshot(pool_dir: Path, device: torch.device, scalar_dim: int) 
     # Get latest snapshot (highest env_steps, then update)
     latest = max(snapshots, key=lambda m: (m.env_steps or 0, m.update or 0))
 
-    # Default config (can be customized if needed)
-    config = {
-        "card_embed_dim": 64,
-        "mlp_dim": 256,
-        "torso_layers": 2,
-        "lstm_hidden": 256,
-        "head_layers": 2,
-        "head_dim": 128,
-    }
-
     snapshot_path = pool_dir / latest.id
-    net = load_snapshot_model(str(snapshot_path), device, scalar_dim, config)
+    net = load_snapshot_model(str(snapshot_path), device, scalar_dim, training_arch_config())
 
     return net, latest
 

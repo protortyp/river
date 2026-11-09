@@ -347,38 +347,6 @@ def autotune_num_envs(
     return rec
 
 
-def _try_alloc(  # noqa: PLR0913
-    *,
-    device: str,
-    num_envs: int,
-    rollout_steps: int,
-    include_eval_env: bool,
-    card_embed_dim: int,
-    mlp_dim: int,
-    torso_layers: int,
-    lstm_hidden: int,
-    head_layers: int,
-    head_dim: int | None,
-) -> bool:
-    """Single-net OK/fail probe. Prefer ``probe_peak``+``autotune_num_envs``."""
-    peak = probe_peak(
-        device=device,
-        num_envs=num_envs,
-        rollout_steps=rollout_steps,
-        include_eval_env=include_eval_env,
-        n_concurrent_nets=1,
-        policy_backbone="lstm",
-        card_embed_dim=card_embed_dim,
-        mlp_dim=mlp_dim,
-        torso_layers=torso_layers,
-        lstm_hidden=lstm_hidden,
-        head_layers=head_layers,
-        head_dim=head_dim,
-        num_epochs=1,
-    )
-    return peak is not None
-
-
 def main() -> int:
     p = argparse.ArgumentParser(description="Probe max safe pokergpu training config")
     p.add_argument("--device", type=str, default="cuda:0")
