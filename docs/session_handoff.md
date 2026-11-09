@@ -57,6 +57,8 @@ Smoke scripts:
 ### Trainer entrypoint
 
 - Main trainer: `train/train.py` (Hydra config `conf/train.yaml`)
+- PPO helpers shared by `train/train.py` and `train/train_exploiter.py` (GAE, MC returns,
+  action statistics, per-player recurrent state selection): `train/ppo_utils.py`
 - Copy/paste summaries: `train/query_training.py` (reads TensorBoard and/or `results.json`)
 
 ### Policy net
