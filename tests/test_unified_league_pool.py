@@ -97,3 +97,12 @@ def test_pfsp_weights_utility() -> None:
     w_var = pfsp_weights_from_bb_per_hand(bb, temperature=1.0, epsilon=0.0, mode="var")
     assert w_var[1] > w_var[0]
     assert w_var[1] > w_var[2]
+
+
+def test_snapshots_from_different_roles_at_same_step_do_not_collide(tmp_path: Path) -> None:
+    pool = UnifiedOpponentPool(pool_dir=tmp_path / "pool", bot_names=[])
+    model = torch.nn.Linear(2, 2)
+    a = pool.add_snapshot(model=model, env_steps=10, update=1, agent_role="main_historical")
+    b = pool.add_snapshot(model=model, env_steps=10, update=1, agent_role="main_exploiter")
+    assert a.id != b.id
+    assert Path(a.id).exists() and Path(b.id).exists()

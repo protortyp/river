@@ -69,7 +69,7 @@ class UnifiedOpponentPool:
         self, *, model: torch.nn.Module, env_steps: int, update: int, agent_role: str
     ) -> OpponentMeta:
         """Add a new snapshot to the pool."""
-        path = self.pool_dir / f"snap_env{env_steps}_upd{update}.pt"
+        path = self.pool_dir / f"snap_{agent_role}_env{env_steps}_upd{update}.pt"
         torch.save(
             {
                 "env_steps": int(env_steps),

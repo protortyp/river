@@ -95,7 +95,7 @@ requiring value targets on opponent-to-act states (env observation includes acti
 - Pool implementation: `train/league.py::UnifiedOpponentPool`
 - Stored under `checkpoint_dir/league_pool/`:
   - `unified_index.json` (metadata)
-  - `snap_env*_upd*.pt` (model state_dict)
+  - `snap_<role>_env*_upd*.pt` (model state_dict)
 - In-memory snapshot ring for fast inference; on startup it loads up to `league_snapshot_pool` most recent snapshots.
 
 Rollout performance:
