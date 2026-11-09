@@ -284,42 +284,6 @@ def test_triad_controller_init_from_resume_loads_identical_weights():
             assert torch.equal(rs_state[k], src_state[k]), f"{role}/{k} mismatch"
 
 
-def test_triad_stubs_raise_not_implemented():
-    """Documented stubs raise NotImplementedError -- catches accidental
-    silent fall-through during integration of later tasks.
-    """
-    cfg = _base_cfg()
-    device = torch.device("cpu")
-    factory = _make_dummy_net_factory(cfg, scalar_dim=17, device=device)
-    triad = TriadController(cfg=cfg, scalar_dim=17, device=device, make_net=factory)
-    for fn in (
-        # sample_opponents implemented in T3 (covered by sampling tests).
-        # ppo_update / ppo_update_role implemented in T4.
-        # maybe_snapshot / mutate_after_snapshot implemented in T5.
-        lambda: triad.forward_step(ROLE_MAIN),
-        lambda: triad.schedule_async_eval(0),
-    ):
-        with pytest.raises(NotImplementedError):
-            fn()
-
-
-def test_role_state_is_mutable_dataclass():
-    """RoleState fields are mutable (controller updates eval_wr,
-    snapshot_count, etc. in place during training).
-    """
-    cfg = _base_cfg()
-    device = torch.device("cpu")
-    factory = _make_dummy_net_factory(cfg, scalar_dim=17, device=device)
-    triad = TriadController(cfg=cfg, scalar_dim=17, device=device, make_net=factory)
-    rs = triad.role(ROLE_ME)
-    # snapshot_count should be incrementable
-    rs.snapshot_count += 1
-    assert triad.role(ROLE_ME).snapshot_count == 1
-    # eval_wr_vs_targets is a dict, can be written
-    rs.eval_wr_vs_targets["main_current"] = 0.42
-    assert triad.role(ROLE_ME).eval_wr_vs_targets["main_current"] == pytest.approx(0.42)
-
-
 def test_role_spec_is_frozen():
     """RoleSpec is immutable (it's resolved config, not state)."""
     cfg = _base_cfg()

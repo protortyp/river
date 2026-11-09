@@ -878,10 +878,6 @@ class TriadController:
         out["opp_id"] = picks
         return out
 
-    def forward_step(self, role: str, **kwargs):  # pragma: no cover - T6
-        """Run the role's net on its env slice. Implemented in T6."""
-        raise NotImplementedError("forward_step wiring lands in T6")
-
     # --------------------------------------------------------- T4: PPO update
 
     def ppo_update_role(
@@ -1136,7 +1132,3 @@ class TriadController:
             agent_role_tag=ROLE_TAG_LE_HISTORICAL if fire else "",
             mutate_kind=rs.spec.mutate_kind,
         )
-
-    def schedule_async_eval(self, current_update: int):  # pragma: no cover - T7
-        """Async eval cadence for ME and LE. Implemented in T7."""
-        raise NotImplementedError("schedule_async_eval lands in T7")
