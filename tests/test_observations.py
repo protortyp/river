@@ -49,7 +49,6 @@ class TestObservations:
         n_envs = 1
         s = GameState()
 
-        # Allocate required arrays
         s.stage = wp.zeros(n_envs, dtype=wp.int32, device=DEVICE)
         s.active_player = wp.zeros(n_envs, dtype=wp.int32, device=DEVICE)
         s.hole_cards = wp.zeros((n_envs, 2, 2), dtype=wp.int32, device=DEVICE)
@@ -101,7 +100,6 @@ class TestObservations:
             s.community_cards[tid, 3] = 23
             s.community_cards[tid, 4] = 24
 
-            # Read all 7 slots
             for i in range(7):
                 out_cards[i] = observations.get_visible_card(s, tid, i)
 

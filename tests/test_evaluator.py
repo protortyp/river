@@ -127,7 +127,6 @@ class TestEvaluator:
         cards_wp = wp.from_numpy(cards_np, dtype=wp.int32, device="cuda")
         scores_wp = wp.zeros(n, dtype=wp.int32, device="cuda")
 
-        # Launch
         wp.launch(
             kernel=test_eval5_kernel,
             dim=n,
@@ -146,7 +145,6 @@ class TestEvaluator:
         for i, score in enumerate(scores):
             print(f"Hand {i}: {score}")
 
-        # Verify strict ascending order
         # Since our input list was ordered by strength, the scores must
         # strictly increase
         for i in range(n - 1):
@@ -250,7 +248,6 @@ class TestEvaluator:
         board_wp = wp.from_numpy(board_np, dtype=wp.int32, device="cuda")
         scores_wp = wp.zeros(n, dtype=wp.int32, device="cuda")
 
-        # Launch
         wp.launch(
             kernel=test_eval7_kernel,
             dim=n,
@@ -267,19 +264,16 @@ class TestEvaluator:
         scores = scores_wp.numpy()
         print("\n7-Card Evaluation Results:")
 
-        # Verify Scenario A (Royal Flush)
         # Royal Flush score is max possible
         royal_score = scores[0]
         assert royal_score > 7400, f"Royal flush score too low: {royal_score}"
         print(f"Scenario A ({expected_descriptions[0]}): {royal_score} (OK)")
 
-        # Verify Scenario B (Quads)
         quads_score = scores[1]
         # Quads is high, but lower than Straight Flush
         assert 7000 < quads_score < royal_score, f"Quads score unexpected: {quads_score}"
         print(f"Scenario B ({expected_descriptions[1]}): {quads_score} (OK)")
 
-        # Verify Scenario C (Flush)
         flush_score = scores[2]
         # Based on lookup generator:
         # - Flush base is ~5873

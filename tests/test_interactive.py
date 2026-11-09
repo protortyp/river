@@ -70,7 +70,6 @@ class TestObservationParsing:
 
     def test_parse_observation_cards_preflop(self):
         """Test parsing cards during preflop (only hole cards)."""
-        # Create mock observation
         obs = {
             "cards": torch.tensor(
                 [

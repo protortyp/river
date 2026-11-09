@@ -28,7 +28,6 @@ class TestActions:
         """Creates a GameState struct with properly allocated SoA arrays for 1 environment."""
         n_envs = 1
 
-        # Allocate backing arrays (SoA layout)
         stacks = wp.zeros((n_envs, 2), dtype=wp.int32, device=DEVICE)
         bets = wp.zeros((n_envs, 2), dtype=wp.int32, device=DEVICE)
         initial_stacks = wp.zeros((n_envs, 2), dtype=wp.int32, device=DEVICE)
@@ -58,7 +57,6 @@ class TestActions:
         cfg_small_blind = wp.zeros(n_envs, dtype=wp.int32, device=DEVICE)
         cfg_big_blind = wp.zeros(n_envs, dtype=wp.int32, device=DEVICE)
 
-        # Create GameState struct instance
         state = GameState()
         state.stacks = stacks
         state.bets = bets
@@ -254,10 +252,9 @@ class TestActions:
         # 5. Invalid: all-in-for-less that exceeds the opponent's effective stack.
         # p0 bet=0, p1 bet=10 → to_call=10. p0 stack=15. p1 stack=4 (very short).
         # last_raise=10 so min_raise=10, but max_raise (opp can match) = 4.
-        # `amount = stack - to_call = 5` was previously accepted by validate_action
-        # because it matched the all-in-for-less rule, even though it exceeded
-        # the opponent's effective stack cap. The mask-vs-apply contract was
-        # broken: the mask said max=4, validate said 5 OK. Now both reject.
+        # `amount = stack - to_call = 5` matches the all-in-for-less rule but
+        # exceeds the opponent's effective stack cap. The mask and
+        # validate_action must agree: the mask says max=4, so 5 is rejected.
         wp.launch(test_raise_valid, dim=1, inputs=[state, 0, 10, 15, 4, 10, 5, out_valid])
         assert out_valid.numpy()[0] == False  # noqa: E712
 
@@ -276,12 +273,8 @@ class TestActions:
             out_actual_raise: wp.array(dtype=wp.int32),
         ):
             tid = wp.tid()
-            # Set up: p0 raised by 50; last_raise = 50. p1 now wants to all-in
-            # for less than 50 (only 30 in stack + to_call already in bets).
-            # We model it directly via apply_action: p1 facing to_call=50 with
-            # only 30 remaining stack, RAISE amount=0 would be a short all-in,
-            # but apply_action expects amount as the raise delta — for the
-            # short-stack case we pass the only legal delta (stack - to_call).
+            # Initial state (overwritten below): p1 faces to_call=50 with only 30
+            # in stack, which can only be called, not raised.
             s.bets[tid, 0] = 50
             s.bets[tid, 1] = 0
             s.stacks[tid, 0] = 950
@@ -293,15 +286,8 @@ class TestActions:
 
             out_last_raise_before[tid] = s.last_raise[tid]
 
-            # p1's only legal raise size is stack-to_call but to_call = 50 > stack=30.
-            # So p1 can call all-in (CALL action), but a RAISE that goes all-in for
-            # less requires we set the state so to_call < stack. Reframe: p0 raised
-            # earlier to 50, but to keep this a RAISE path we need bets that allow
-            # a raise. Re-setup as: p0 bet 10 (initial raise), to_call=10 for p1,
-            # last_raise=10. p1 stack=25, p1 raise delta=15 (= stack-to_call=15)
-            # which exceeds prior last_raise=10. NOT a short all-in.
-            # We want short: set last_raise=20 (someone raised by 20), p0 bet 20,
-            # to_call=20, p1 stack=25 -> stack-to_call=5, which is < min_raise=20.
+            # Short all-in raise: last_raise=20, p0 bet 20 so to_call=20, and p1's
+            # stack of 25 leaves stack-to_call=5, which is < min_raise=20.
             s.bets[tid, 0] = 20
             s.bets[tid, 1] = 0
             s.stacks[tid, 0] = 1000
@@ -326,7 +312,6 @@ class TestActions:
 
         # apply_action moved a chip, but because actual_raise (5) < prior
         # min-raise threshold (20), the engine must NOT update last_raise.
-        # Previously: last_raise would have been overwritten to 5.
         assert out_after.numpy()[0] == 20, (
             f"last_raise should stay at 20 after all-in-for-less; got {out_after.numpy()[0]}"
         )
@@ -374,12 +359,10 @@ class TestActions:
 
         wp.launch(test_apply, dim=1, inputs=[state, res_agg, res_raise, res_num, res_done])
 
-        # Verify Raise Updates
         assert res_agg.numpy()[0] == 0
         assert res_raise.numpy()[0] == 50
         assert res_num.numpy()[0] == 1
 
-        # Verify Fold Updates
         assert res_done.numpy()[0] == True  # noqa: E712
 
     def test_apply_action_raise_effective_stack_cap_total(self, state):

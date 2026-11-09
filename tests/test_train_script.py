@@ -454,7 +454,6 @@ def test_train_script_cpu_triad_mlflow_smoke(tmp_path):
     result = run(cfg)
     assert result.env_steps >= 384 * 4 * 2
 
-    # Verify the run lives on the server with the expected metadata.
     configure_mlflow(experiment="pokergpu-tests")
     runs = mlflow.search_runs(
         experiment_names=["pokergpu-tests"],

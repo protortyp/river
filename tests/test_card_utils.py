@@ -12,7 +12,6 @@ import warp as wp
 from gpu_poker import constants as c
 from gpu_poker.kernels import card_utils
 
-# Initialize Warp once
 wp.init()
 
 
@@ -55,21 +54,18 @@ class TestCardUtils:
         cards_input = np.array([0, 12, 13, 51, -5], dtype=np.int32)
         n = len(cards_input)
 
-        # Allocate memory
         card_ids_wp = wp.from_numpy(cards_input, dtype=wp.int32)
         out_rank = wp.zeros(n, dtype=wp.int32)
         out_suit = wp.zeros(n, dtype=wp.int32)
         out_mask = wp.zeros(n, dtype=wp.int32)
         out_prime = wp.zeros(n, dtype=wp.int32)
 
-        # Launch kernel
         wp.launch(
             kernel=test_conversions_kernel,
             dim=n,
             inputs=[card_ids_wp, primes_lut, out_rank, out_suit, out_mask, out_prime],
         )
 
-        # Copy back to CPU
         ranks = out_rank.numpy()
         suits = out_suit.numpy()
         masks = out_mask.numpy()
@@ -122,7 +118,6 @@ class TestCardUtils:
         deck_np = deck_wp.numpy()
         expected = np.arange(52, dtype=np.int32)
 
-        # Verify exact 0..51 sequence
         np.testing.assert_equal(deck_np, expected)
 
         # 2. Test Shuffling

@@ -51,7 +51,6 @@ def gpu_card_to_treys(gpu_card: int) -> int:
 
 def treys_to_gpu_card(treys_card: int) -> int:
     """Convert treys Card integer to GPU card representation."""
-    # Get the string representation from treys
     card_str = Card.int_to_str(treys_card)
     rank_char = card_str[0]
     suit_char = card_str[1].lower()
@@ -180,7 +179,6 @@ class TestEvaluatorVsTreys:
 
         gpu_scores = scores_wp.numpy()
 
-        # Get treys scores and compare rankings
         treys_scores = []
         for hand in test_hands:
             treys_hand = [gpu_card_to_treys(c) for c in hand]
@@ -239,7 +237,6 @@ class TestEvaluatorVsTreys:
 
         gpu_scores = scores_wp.numpy()
 
-        # Get treys scores
         treys_scores = []
         for hand in hands:
             treys_hand = [gpu_card_to_treys(c) for c in hand]
@@ -342,7 +339,6 @@ class TestEvaluatorVsTreys:
 
         gpu_scores = scores_wp.numpy()
 
-        # Get treys scores
         treys_scores = []
         for hole, board in zip(hole_cards, boards, strict=False):
             treys_hole = [gpu_card_to_treys(c) for c in hole]
@@ -644,7 +640,6 @@ class TestEvaluatorVsTreys:
 
         gpu_scores = scores_wp.numpy()
 
-        # Get treys scores
         treys_scores = []
         for hand in edge_cases:
             treys_hand = [gpu_card_to_treys(c) for c in hand]

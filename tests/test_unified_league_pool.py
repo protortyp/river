@@ -33,14 +33,12 @@ def test_unified_pool_add_snapshot_and_update(tmp_path: Path) -> None:
     opponents = pool.load_index()
     assert len(opponents) == 2  # 1 bot + 1 snapshot
 
-    # Update stats for snapshot
     pool.update_eval(opponent_id=meta.id, bb_per_hand=0.1, hands=100)
     opponents = pool.load_index()
     snap = next(o for o in opponents if o.id == meta.id)
     assert snap.bb_per_hand == 0.1
     assert snap.hands == 100
 
-    # Update stats for bot
     pool.update_eval(opponent_id="bot_a", bb_per_hand=-0.5, hands=200)
     opponents = pool.load_index()
     bot = next(o for o in opponents if o.id == "bot_a")

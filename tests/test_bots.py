@@ -31,7 +31,6 @@ def test_random_aggressive_always_legal():
     a, rf = bots.random_aggressive({"action_mask": mask})
     assert a.shape == (128,)
     assert rf.shape == (128, 1)
-    # Check legality
     assert torch.all(mask[torch.arange(128), a.to(dtype=torch.int64)])
 
 

@@ -1,9 +1,7 @@
 """Tests for the AlphaStar triad controller.
 
-This file grows incrementally as the T1-T11 implementation lands. As of
-T1 (controller skeleton), only the construction-time invariants are
-testable; per-role behavior tests (sampling, mutate, snapshot triggers,
-gradient isolation) land alongside their respective tasks.
+Covers construction-time invariants, per-role opponent sampling, PPO
+gradient isolation, and snapshot triggers / post-snapshot mutation.
 """
 
 from __future__ import annotations
@@ -136,7 +134,7 @@ def _make_dummy_net_factory(cfg: TrainConfig, scalar_dim: int = 17, device=None)
 
 
 # --------------------------------------------------------------------------- #
-# T1: RoleSpec + env partition + TriadController.__init__
+# RoleSpec + env partition + TriadController.__init__
 # --------------------------------------------------------------------------- #
 
 
@@ -197,7 +195,7 @@ def test_env_partition_absorbs_int_truncation_into_le():
 
 
 def test_triad_controller_init_creates_three_independent_nets():
-    """T1 core invariant: 3 nets allocated, distinct objects, correct shapes."""
+    """Core invariant: 3 nets allocated, distinct objects, correct shapes."""
     cfg = _base_cfg()
     device = torch.device("cpu")
     factory = _make_dummy_net_factory(cfg, scalar_dim=17, device=device)
@@ -304,7 +302,7 @@ def test_unknown_role_raises_keyerror():
 
 
 # --------------------------------------------------------------------------- #
-# T3: sample_opponents helpers + per-role distributions
+# sample_opponents helpers + per-role distributions
 # --------------------------------------------------------------------------- #
 
 
@@ -559,7 +557,7 @@ def test_sample_opponents_output_device_and_dtype():
 
 
 # --------------------------------------------------------------------------- #
-# T4: ppo_update with gradient isolation
+# ppo_update with gradient isolation
 # --------------------------------------------------------------------------- #
 
 
@@ -740,7 +738,7 @@ def test_ppo_update_runs_all_three_roles():
 
 
 # --------------------------------------------------------------------------- #
-# T5: maybe_snapshot + mutate_after_snapshot
+# maybe_snapshot + mutate_after_snapshot
 # --------------------------------------------------------------------------- #
 
 
@@ -874,7 +872,7 @@ def test_mutate_after_snapshot_me_copies_main_params():
     )
     applied = triad.mutate_after_snapshot(ROLE_ME, 0)
     assert applied == "reset_to_main"
-    # ME now byte-identical to M.
+    # ME is byte-identical to M.
     assert _params_equal(
         triad.role(ROLE_MAIN).net.state_dict(),
         triad.role(ROLE_ME).net.state_dict(),
@@ -924,7 +922,7 @@ def test_mutate_after_snapshot_increments_snapshot_count():
 
 
 # --------------------------------------------------------------------------- #
-# maybe_force_reset_me: AlphaStar §3 stalling-fix for ME
+# maybe_force_reset_me: periodic forced reset of ME (AlphaStar §3)
 # --------------------------------------------------------------------------- #
 
 

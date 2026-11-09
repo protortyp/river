@@ -18,7 +18,6 @@ from gpu_poker import constants as c
 from gpu_poker.kernels import state
 from gpu_poker.struct_types import GameState
 
-# Initialize Warp
 wp.init()
 
 # Device selection
@@ -59,7 +58,6 @@ class TestState:
         """Creates a single-environment GameState (SoA layout) on Device."""
         n_envs = 1
 
-        # Allocate all backing arrays
         # Note: We use zeros to ensure clean state
         s = GameState()
         s.stage = wp.zeros(n_envs, dtype=wp.int32, device=DEVICE)
@@ -218,7 +216,6 @@ class TestState:
             for i in range(c.NUM_CARDS):
                 s.deck[tid, i] = i
 
-            # Set starting pointers
             s.deck_top[tid] = start_deck_top
             s.num_community[tid] = 0  # This resets community count, logic below handles offset
 

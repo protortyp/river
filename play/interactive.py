@@ -126,7 +126,6 @@ def load_snapshot_model(
     # Clean state dict if from compiled model (removes '_orig_mod.' prefix)
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
 
-    # Create network with config
     net = PokerPolicyNet(
         scalar_dim=scalar_dim,
         card_embed_dim=config.get("card_embed_dim", 64),
@@ -257,7 +256,6 @@ def display_game_state(
     console.print(title)
     console.print()
 
-    # Get game info
     big_blind = obs["big_blind"][env_idx].item()
     player_stack, opp_stack, player_bet, opp_bet = get_player_stacks_and_bets(obs, env_idx)
     pot = get_pot_size(obs, env_idx)
@@ -461,7 +459,6 @@ def get_human_action(obs: dict, env_idx: int = 0) -> tuple[int, int]:
         console.print(f"[dim]Raise range: {min_raise} - {max_raise} chips (delta)[/dim]")
         console.print()
 
-    # Get input
     while True:
         user_input = Prompt.ask("[bold green]Your action[/bold green]")
         result = parse_human_input(user_input, obs, env_idx)
@@ -530,7 +527,6 @@ class GameSession:
         """Play one complete hand and return results."""
         self.hands_played += 1
 
-        # Reset environment
         obs = self.env.reset()
         env_idx = 0
 
@@ -602,7 +598,6 @@ class GameSession:
                         deterministic=False,
                     )
 
-                # Update LSTM state
                 self.h, self.c = policy_out.h, policy_out.c
 
                 action_type = policy_out.action_type[0].item()
@@ -699,7 +694,6 @@ class GameSession:
                 console.print(f"[bold red]Agent wins {abs(chips_won)} chips![/bold red]")
             console.print()
 
-        # Reset LSTM state for new hand
         self.h, self.c = PokerPolicyNet.init_state(1, self.agent_net.lstm_hidden, self.device)
 
         return {
@@ -820,7 +814,6 @@ def main():
 
     device = torch.device(args.device)
 
-    # Initialize Warp
     wp.init()
 
     # Create environment (num_envs=1 for interactive play)
@@ -831,7 +824,6 @@ def main():
         big_blind=args.big_blind,
     )
 
-    # Get scalar dim from environment
     obs = env.reset()
     scalar_dim = obs["scalars"].shape[1]
 

@@ -219,7 +219,6 @@ def profile_with_network(
     wp.init()
     env = WarpPokerEnv(num_envs=num_envs, device=device)
 
-    # Create policy network
     net = PokerPolicyNet(
         scalar_dim=17,
         card_embed_dim=64,
@@ -317,7 +316,6 @@ def profile_ppo_update(
     total_samples = num_envs * rollout_steps
     num_minibatches = total_samples // minibatch_size
 
-    # Create network
     net = PokerPolicyNet(
         scalar_dim=17,
         card_embed_dim=64,

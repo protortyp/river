@@ -171,7 +171,6 @@ def bench_memory_operations(num_envs: int, device: str, iterations: int = 100) -
 
     wp.init()
 
-    # Create arrays
     wp_arr = wp.zeros(num_envs, dtype=wp.int32, device=device)
     torch_tensor = torch.zeros(num_envs, dtype=torch.int32, device=device)
 

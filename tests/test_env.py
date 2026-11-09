@@ -53,7 +53,6 @@ class TestWarpPokerEnv:
         num_envs = 64
         env = WarpPokerEnv(num_envs=num_envs, device=DEVICE)
 
-        # Reset returns dict of torch tensors
         obs = env.reset()
 
         assert "cards" in obs
@@ -85,7 +84,6 @@ class TestWarpPokerEnv:
         assert big_blind.shape == (num_envs,)
         assert not torch.any(terminated)
 
-        # Verify Preflop State
         # Board cards (indices 2-6) should be -1
         board_cards = cards[:, 2:]
         assert torch.all(board_cards == -1)
@@ -94,7 +92,6 @@ class TestWarpPokerEnv:
         hole_cards = cards[:, :2]
         assert torch.all(hole_cards >= 0)
 
-        # Verify Scalars
         # Stage (index 7) should be 0.0 (Preflop)
         assert torch.all(scalars[:, 7] == 0.0)
 
@@ -103,7 +100,6 @@ class TestWarpPokerEnv:
         expected_pot = (c.SMALL_BLIND + c.BIG_BLIND) / (c.STARTING_STACK * 2)
         assert torch.allclose(scalars[:, 5], torch.tensor(expected_pot, device=DEVICE))
 
-        # Check player stacks (indices 1 and 2)
         # Active player is SB (player 0), so obs are from their perspective
         # Player stack (index 1) is SB's stack: 1000 - 1 = 999
         # Opponent stack (index 2) is BB's stack: 1000 - 2 = 998
@@ -140,7 +136,6 @@ class TestWarpPokerEnv:
         env = WarpPokerEnv(num_envs=num_envs, device=DEVICE)
         env.reset()
 
-        # Create dummy actions (Fold = 0)
         actions = torch.zeros(num_envs, dtype=torch.int32, device=DEVICE)
 
         # Step

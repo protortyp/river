@@ -234,5 +234,5 @@ class TestInvariants:
 
         wp.launch(kernel, dim=1, inputs=[s, obs_cards, obs_scalars])
         val = float(obs_scalars.numpy()[0, 6])
-        # Before the fix: 200/50 = 4.0. After: clamped to 50/50 = 1.0.
+        # Raw ratio 200/50 = 4.0 must be clamped to 1.0.
         assert val == 1.0, f"to_call/stack should clip to 1.0, got {val}"
