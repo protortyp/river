@@ -155,13 +155,11 @@ class RoleState:
     # Snapshot bookkeeping.
     snapshot_count: int = 0
     last_snapshot_update: int = -1
-    # The id of the M snapshot this ME/LE was forked from (for filename
-    # provenance per D10). None for M.
-    parent_main_id: str | None = None
-    # Most recent eval-WR per target (e.g., {"main_current": 0.62,
-    # "main_historical_5": 0.71, ...}). Refreshed by
-    # ``schedule_async_eval``; read by ``maybe_snapshot``.
+    # Most recent eval win rate in [0, 1] per target (e.g. {"main_current": 0.62}).
+    # Snapshot gates compare these against win-rate thresholds, so only win
+    # rates belong here; raw bb/hand lives in ``eval_bb_per_hand_vs_targets``.
     eval_wr_vs_targets: dict[str, float] = field(default_factory=dict)
+    eval_bb_per_hand_vs_targets: dict[str, float] = field(default_factory=dict)
 
     @property
     def slice_n(self) -> int:
@@ -185,7 +183,7 @@ class SnapshotDecision:
         snapshot with so the per-role samplers in T3 see it correctly.
         Empty when ``should_snapshot=False``.
       mutate_kind: post-snapshot mutation to apply (see RoleSpec
-        docstring). Caller MUST call ``mutate_after_snapshot(role)``
+        docstring). Caller MUST call ``mutate_after_snapshot(role, update)``
         after writing the .pt file iff ``should_snapshot`` is True.
     """
 
@@ -958,11 +956,10 @@ class TriadController:
         caller (train.py T6) is responsible for:
           1. Writing the .pt for each role with ``should_snapshot=True``,
              tagging with ``decision.agent_role_tag``.
-          2. Calling ``mutate_after_snapshot(role)`` immediately after,
-             so the snapshot on disk reflects the PRE-mutation weights.
-          3. (Optional) Updating ``last_snapshot_update`` /
-             ``snapshot_count`` on the role -- the controller updates
-             these inside ``mutate_after_snapshot`` for atomicity.
+          2. Calling ``mutate_after_snapshot(role, update)`` immediately
+             after, so the snapshot on disk reflects the PRE-mutation
+             weights. That call also records the snapshot bookkeeping
+             (``snapshot_count`` and ``last_snapshot_update``).
 
         Triggers:
           MAIN: every ``triad_main_snapshot_every`` updates
@@ -979,7 +976,7 @@ class TriadController:
             out[role] = self._role_snapshot_decision(role, int(update))
         return out
 
-    def mutate_after_snapshot(self, role: str) -> str:
+    def mutate_after_snapshot(self, role: str, update: int) -> str:
         """Apply the role's post-snapshot mutation in-place.
 
         Returns the mutation actually applied:
@@ -990,10 +987,8 @@ class TriadController:
           - "random_reinit"   -- LE rolled below ``triad_le_reset_prob``
                                  and got a fresh random init.
 
-        Also bumps ``role.snapshot_count`` and updates
-        ``last_snapshot_update`` (the caller passes ``update`` separately
-        via maybe_snapshot but the *bookkeeping* is centralized here so
-        train.py can't forget to do it).
+        Also bumps ``role.snapshot_count`` and sets ``last_snapshot_update``
+        to ``update``.
         """
         rs = self.role(role)
         kind = rs.spec.mutate_kind
@@ -1012,6 +1007,7 @@ class TriadController:
                 applied = "noop"
         # M's "never" path falls through with applied="noop".
         rs.snapshot_count += 1
+        rs.last_snapshot_update = int(update)
         return applied
 
     def maybe_force_reset_me(self, update: int) -> dict[str, int | str] | None:
@@ -1110,10 +1106,9 @@ class TriadController:
 
     def _snapshot_decision_le(self, rs: RoleState, update: int) -> SnapshotDecision:
         threshold = float(rs.spec.snapshot_wr_threshold or 0.0)
-        # LE's snapshot trigger: "beat EVERY non-LE target by >= threshold".
-        # Filter out LE-historical targets (those keys start with "le_" by
-        # convention written by T7 / async eval). If no non-LE targets have
-        # been evaluated yet, defer.
+        # LE snapshots once it beats every evaluated target by >= threshold.
+        # Targets keyed "le_*" are LE's own historical snapshots, which it
+        # need not beat.
         targets = {k: float(v) for k, v in rs.eval_wr_vs_targets.items() if not k.startswith("le_")}
         if not targets:
             return SnapshotDecision(

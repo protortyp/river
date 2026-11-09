@@ -825,6 +825,24 @@ def test_maybe_snapshot_le_ignores_le_historical_keys():
     assert dec.agent_role_tag == "league_exploiter"
 
 
+def test_le_gate_ignores_raw_bb_per_hand_eval():
+    # bb/hand lives beside the win rates, so a small bb/hand value cannot veto
+    # a snapshot whose win rates all clear the threshold.
+    cfg = _base_cfg(triad_le_promote_wr=0.70)
+    triad = _make_triad(cfg)
+    rs = triad.role(ROLE_LE)
+    rs.eval_wr_vs_targets["main_current"] = 0.80
+    rs.eval_bb_per_hand_vs_targets["main_current"] = 0.2
+    dec = triad.maybe_snapshot(10, env_steps=10000)[ROLE_LE]
+    assert dec.should_snapshot is True
+
+
+def test_mutate_after_snapshot_records_update():
+    triad = _make_triad()
+    triad.mutate_after_snapshot(ROLE_ME, 17)
+    assert triad.role(ROLE_ME).last_snapshot_update == 17
+
+
 def test_maybe_snapshot_le_no_eval_data_defers():
     triad = _make_triad()
     dec = triad.maybe_snapshot(10, env_steps=10000)[ROLE_LE]
@@ -836,7 +854,7 @@ def test_mutate_after_snapshot_main_is_noop():
     """M never mutates -- its params must be byte-identical after."""
     triad = _make_triad()
     before = {k: v.clone() for k, v in triad.role(ROLE_MAIN).net.state_dict().items()}
-    applied = triad.mutate_after_snapshot(ROLE_MAIN)
+    applied = triad.mutate_after_snapshot(ROLE_MAIN, 0)
     after = triad.role(ROLE_MAIN).net.state_dict()
     assert applied == "noop"
     for k in before:
@@ -854,7 +872,7 @@ def test_mutate_after_snapshot_me_copies_main_params():
         triad.role(ROLE_MAIN).net.state_dict(),
         triad.role(ROLE_ME).net.state_dict(),
     )
-    applied = triad.mutate_after_snapshot(ROLE_ME)
+    applied = triad.mutate_after_snapshot(ROLE_ME, 0)
     assert applied == "reset_to_main"
     # ME now byte-identical to M.
     assert _params_equal(
@@ -868,7 +886,7 @@ def test_mutate_after_snapshot_le_random_with_prob_zero_is_noop():
     triad = _make_triad(cfg)
     before = {k: v.clone() for k, v in triad.role(ROLE_LE).net.state_dict().items()}
     for _ in range(10):
-        applied = triad.mutate_after_snapshot(ROLE_LE)
+        applied = triad.mutate_after_snapshot(ROLE_LE, 0)
         assert applied == "noop"
     after = triad.role(ROLE_LE).net.state_dict()
     for k in before:
@@ -879,7 +897,7 @@ def test_mutate_after_snapshot_le_random_with_prob_one_always_reinits():
     cfg = _base_cfg(triad_le_reset_prob=1.0)
     triad = _make_triad(cfg)
     before = {k: v.clone() for k, v in triad.role(ROLE_LE).net.state_dict().items()}
-    applied = triad.mutate_after_snapshot(ROLE_LE)
+    applied = triad.mutate_after_snapshot(ROLE_LE, 0)
     after = triad.role(ROLE_LE).net.state_dict()
     assert applied == "random_reinit"
     # Net has changed (fresh random init -> not byte-equal to prior state).
@@ -892,7 +910,7 @@ def test_mutate_after_snapshot_le_random_with_prob_half_distribution():
     triad = _make_triad(cfg)
     torch.manual_seed(0)
     n = 500
-    resets = sum(triad.mutate_after_snapshot(ROLE_LE) == "random_reinit" for _ in range(n))
+    resets = sum(triad.mutate_after_snapshot(ROLE_LE, 0) == "random_reinit" for _ in range(n))
     frac = resets / n
     assert 0.40 < frac < 0.60, f"reset fraction {frac:.3f} not near 0.5"
 
@@ -901,7 +919,7 @@ def test_mutate_after_snapshot_increments_snapshot_count():
     triad = _make_triad()
     assert triad.role(ROLE_MAIN).snapshot_count == 0
     for i in range(1, 4):
-        triad.mutate_after_snapshot(ROLE_MAIN)
+        triad.mutate_after_snapshot(ROLE_MAIN, 0)
         assert triad.role(ROLE_MAIN).snapshot_count == i
 
 

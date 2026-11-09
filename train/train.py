@@ -3080,8 +3080,7 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
                     # bb_per_hand ~= 0.17 = +17 bb/100.
                     wr = float(torch.sigmoid(torch.tensor(bb_avg * 5.0)).item())
                     rs.eval_wr_vs_targets["main_current"] = wr
-                    # Also emit raw bb/hand for the user-facing metric.
-                    rs.eval_wr_vs_targets["main_current_bb_per_hand"] = bb_avg
+                    rs.eval_bb_per_hand_vs_targets["main_current"] = bb_avg
                 finally:
                     rs.net.train()
             main_net.train()
@@ -3110,8 +3109,7 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
                 new_scores[: opponent_scores.numel()] = opponent_scores
                 opponent_scores = new_scores
             opponent_scores[len(opponent_metas) - 1] = 0.0
-            rs.last_snapshot_update = update
-            applied = triad.mutate_after_snapshot(role)
+            applied = triad.mutate_after_snapshot(role, update)
             if writer is not None:
                 writer.add_scalar(f"{role}/snapshot_count", float(rs.snapshot_count), env_steps)
                 writer.add_scalar(f"{role}/snapshot_applied_{applied}", 1.0, env_steps)
@@ -3225,6 +3223,12 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
                     mlf_metrics[f"{role}/eval_wr/{target_id}"] = float(wr)
                     if writer is not None:
                         writer.add_scalar(f"{role}/eval_wr/{target_id}", float(wr), env_steps)
+                for target_id, bb in rs.eval_bb_per_hand_vs_targets.items():
+                    mlf_metrics[f"{role}/eval_wr/{target_id}_bb_per_hand"] = float(bb)
+                    if writer is not None:
+                        writer.add_scalar(
+                            f"{role}/eval_wr/{target_id}_bb_per_hand", float(bb), env_steps
+                        )
 
                 # Opponent-mix breakdown (from the *current* live assignment;
                 # cheap to compute and meaningful as a recent-state snapshot).
