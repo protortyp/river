@@ -40,7 +40,6 @@ class UnifiedOpponentPool:
     def load_index(self) -> list[OpponentMeta]:
         """Load index, ensuring bots are always present."""
         if not self.index_path.exists():
-            # Initialize with bots only
             opponents = [OpponentMeta(id=name, kind="bot") for name in self.bot_names]
             self.save_index(opponents)
             return opponents

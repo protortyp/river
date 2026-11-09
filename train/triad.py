@@ -84,7 +84,7 @@ OPP_LIVE_MAIN: int = 3
 
 # agent_role tags used in the unified opponent pool. We centralize them
 # here so the role-aware filters used in sample_opponents stay in lockstep
-# with the snapshot writer in T5.
+# with the snapshot writer.
 ROLE_TAG_MAIN_CURRENT: str = "main"
 ROLE_TAG_MAIN_HISTORICAL: str = "main_historical"
 ROLE_TAG_LE_HISTORICAL: str = "league_exploiter"
@@ -180,7 +180,7 @@ class SnapshotDecision:
       reason: human-readable explanation -- "periodic", "wr_threshold",
         "below_wr_threshold", "no_eval_data", "noop_M_only_periodic".
       agent_role_tag: the ``OpponentMeta.agent_role`` to tag the new
-        snapshot with so the per-role samplers in T3 see it correctly.
+        snapshot with so the per-role samplers see it correctly.
         Empty when ``should_snapshot=False``.
       mutate_kind: post-snapshot mutation to apply (see RoleSpec
         docstring). Caller MUST call ``mutate_after_snapshot(role, update)``
@@ -330,7 +330,7 @@ def _pfsp_sample_indices(
 
 
 # --------------------------------------------------------------------------- #
-# T4: per-role PPO update (gradient-isolation primitive)
+# Per-role PPO update (gradient-isolation primitive)
 # --------------------------------------------------------------------------- #
 
 
@@ -348,8 +348,8 @@ def _ppo_update_one_role(
 
     Mirrors the league-path PPO update in train.py (MC returns,
     train-mask-weighted loss, clipped surrogate + value + entropy) but
-    scoped to one net/opt with no AMP/scaler tangle. T6 may wrap calls in
-    ``torch.autocast`` externally; the role's parameters and the loss
+    scoped to one net/opt with no AMP/scaler tangle. Callers may wrap calls in
+    ``torch.autocast``; the role's parameters and the loss
     accumulators stay fp32 either way.
 
     The forward / backward / step here only touch ``rs.net`` and
@@ -390,12 +390,9 @@ def _ppo_update_one_role(
     mb_size = int(cfg.minibatch_size)
     num_mbs = (total + mb_size - 1) // max(1, mb_size)
 
-    # GPU tensor accumulators -- crucial perf fix. The previous version
-    # called .item() on 7 tensors per minibatch, each forcing a full CUDA
-    # synchronize (CPU waits for all pending kernels). At 256 minibatches
-    # per role x 3 roles = 5,376 forced syncs per PPO update on the triad
-    # path, which dominated wall-clock. The non-triad path (train.py:1032,
-    # 1670+) already uses GPU accumulators; aligning here.
+    # GPU tensor accumulators: calling .item() per minibatch would force a
+    # full CUDA synchronize each time (hundreds of syncs per role per PPO
+    # update), so sums stay on device and are read back once at the end.
     loss_sum_t = torch.zeros((), device=device, dtype=torch.float32)
     policy_loss_sum_t = torch.zeros((), device=device, dtype=torch.float32)
     value_loss_sum_t = torch.zeros((), device=device, dtype=torch.float32)
@@ -403,13 +400,12 @@ def _ppo_update_one_role(
     kl_sum_t = torch.zeros((), device=device, dtype=torch.float32)
     kl_abs_sum_t = torch.zeros((), device=device, dtype=torch.float32)
     clipfrac_sum_t = torch.zeros((), device=device, dtype=torch.float32)
-    # Pre-clip gradient norm accumulator (audit gap #2 fix). clip_grad_norm_
-    # returns this tensor, so logging it is essentially free.
+    # Pre-clip gradient norm accumulator. clip_grad_norm_ returns this
+    # tensor, so logging it is essentially free.
     grad_norm_sum_t = torch.zeros((), device=device, dtype=torch.float32)
     # Explained variance: 1 - Var(returns - value) / Var(returns). Crucial
     # value-function quality signal -- if EV collapses the critic isn't
-    # learning. Non-triad path computes this at train.py:1494/1544/1737;
-    # triad path was missing it entirely (audit gap #2).
+    # learning.
     ev_sum_t = torch.zeros((), device=device, dtype=torch.float32)
     # Raw variance + residual variance so we can distinguish
     # "EV low because critic bad" from "EV low because target variance huge".
@@ -503,10 +499,9 @@ def _ppo_update_one_role(
             )
             rs.opt.step()
 
-            # GPU accumulators -- no .item() inside the inner loop. Each
-            # .item() previously stalled the GPU pipeline waiting for all
-            # pending kernels to finish; with 256 minibatches and 7 such
-            # syncs per minibatch this was the dominant cost of PPO.
+            # GPU accumulators -- no .item() inside the inner loop, since
+            # each one would stall the GPU pipeline until all pending
+            # kernels finish.
             loss_sum_t = loss_sum_t + loss.detach()
             policy_loss_sum_t = policy_loss_sum_t + policy_loss.detach()
             value_loss_sum_t = value_loss_sum_t + value_loss.detach()
@@ -592,7 +587,7 @@ class TriadController:
         self.cfg = cfg
         self.scalar_dim = int(scalar_dim)
         self.device = device
-        # Retained for the LE "random_with_prob" mutate path and for T9
+        # Retained for the LE "random_with_prob" mutate path and for
         # per-role resume (re-instantiate a fresh net, then load).
         self._make_net: Callable[[], PolicyNet] = make_net
 
@@ -607,24 +602,19 @@ class TriadController:
 
             net = make_net()
             # torch.compile each role's net when cfg.compile_policy is set.
-            # The historical concern was that mutate_after_snapshot's
-            # load_state_dict would invalidate the compiled graph. In
-            # practice load_state_dict uses .data.copy_() which preserves
-            # the parameter tensor identities the graph captures, so the
-            # swap is transparent. Snapshot opponents loaded ad-hoc via
-            # _load_snapshot remain uncompiled (they only run forward and
-            # change per-step, so compile-and-cache wouldn't pay off).
+            # mutate_after_snapshot's load_state_dict does not invalidate the
+            # compiled graph: it uses .data.copy_(), which preserves the
+            # parameter tensor identities the graph captures. Snapshot
+            # opponents loaded ad-hoc via _load_snapshot remain uncompiled
+            # (they only run forward and change per-step, so
+            # compile-and-cache wouldn't pay off).
             if bool(getattr(cfg, "compile_policy", False)):
                 # mode="default": kernel fusion via Inductor without CUDA
                 # graphs. Less aggressive than "reduce-overhead" but more
                 # tolerant of the data-dependent control flow in
                 # evaluate_step (reset masks, terminated branch, etc.).
-                # Note: empirically had no measurable PPO speedup on
-                # transformer triad (tested 2026-05-17 on RTX A5000 +
-                # RTX 3090: 109s baseline vs 109s with compile, both
-                # modes). Left in for completeness / future PyTorch
-                # versions that may improve Inductor fusion on this
-                # workload.
+                # Empirically no measurable PPO speedup on the transformer
+                # triad (RTX A5000 / RTX 3090: 109s with and without compile).
                 # torch.compile is typed as returning a bare Callable; the
                 # OptimizedModule it actually returns proxies every attribute
                 # (evaluate_step / lstm_hidden / state_dict / ...) to the
@@ -632,9 +622,8 @@ class TriadController:
                 net = cast("PolicyNet", torch.compile(net, mode="default", dynamic=False))
             # fused=True: single CUDA kernel for the optimizer step. With 256
             # minibatches per role per update on the triad path, the per-step
-            # overhead of unfused Adam (one launch per parameter tensor) was a
-            # major chunk of PPO wall time. Non-triad path already uses
-            # fused=True (train.py:793); align here.
+            # overhead of unfused Adam (one launch per parameter tensor) is a
+            # major chunk of PPO wall time.
             opt = torch.optim.AdamW(net.parameters(), lr=spec.lr, fused=True)
 
             buf = RolloutBuffer(
@@ -693,7 +682,7 @@ class TriadController:
         for role in ROLES:
             self.roles[role].net.load_state_dict(state_dict)
 
-    # --------------------------------------------------------- T3: sampling
+    # --------------------------------------------------------- sampling
 
     def sample_opponents(
         self,
@@ -876,7 +865,7 @@ class TriadController:
         out["opp_id"] = picks
         return out
 
-    # --------------------------------------------------------- T4: PPO update
+    # --------------------------------------------------------- PPO update
 
     def ppo_update_role(
         self,
@@ -947,7 +936,7 @@ class TriadController:
             )
         return out
 
-    # --------------------------------------------------------- T5: snapshots
+    # --------------------------------------------------------- snapshots
 
     def maybe_snapshot(self, update: int, env_steps: int) -> dict[str, SnapshotDecision]:
         """Return per-role snapshot decisions for this update.

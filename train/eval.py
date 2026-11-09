@@ -134,9 +134,8 @@ def eval_vs_bot(
             if stats is not None:
                 st = _street_from_scalars(obs["scalars"][is_learner])
                 a = out.action_type.to(dtype=torch.int64)
-                # Accumulate by street. (We track bucket idx as a proxy for the
-                # raise-frac stats; the dashboard keys still use 'raise_frac' for
-                # backward-compat with older eval consumers.)
+                # Accumulate by street. The bucket index (normalized to [0, 1])
+                # stands in for the raise fraction in the 'raise_frac' stats.
                 bucket_proxy = out.raise_bucket.to(dtype=torch.float32) / max(
                     1, NUM_RAISE_BUCKETS - 1
                 )

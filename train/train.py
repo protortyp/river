@@ -175,8 +175,8 @@ class TrainConfig:
     device: str
     num_envs: int
     rollout_steps: int
-    # Termination: prefer `total_env_steps` (set >0). `num_updates` is kept for
-    # backward-compatibility but is not recommended.
+    # Termination: prefer `total_env_steps` (set >0). `num_updates` is an
+    # alternative but not recommended.
     total_env_steps: int
     num_updates: int
     lr: float
@@ -288,7 +288,7 @@ class TrainConfig:
     small_blind: int = 5
     big_blind: int = 10
 
-    # =================== AlphaStar triad (G) ===================================
+    # =================== AlphaStar triad =======================================
     # When `triad_enabled=true`, training runs three concurrent agents
     # (Main, Main Exploiter, League Exploiter) on partitioned slices of
     # `num_envs`, each with its own network + optimizer. See
@@ -317,11 +317,10 @@ class TrainConfig:
     # regardless of whether they snapshotted, to escape local optima.
     # Without this, once Main catches up to ME, ME's WR collapses below
     # `triad_me_promote_wr` and ME can never snapshot again -- the
-    # `reset_to_main` mutation only fires *on* snapshot. See
-    # wiki/me-exploiter-stalling.md. 0 = disabled (matches pre-2026
-    # behaviour); 50 = AlphaStar default.
+    # `reset_to_main` mutation only fires *on* snapshot. 0 = disabled;
+    # 50 = AlphaStar default.
     triad_me_force_reset_every: int = 0
-    # Async eval cadence (updates) and hands per eval matchup.
+    # Eval cadence (updates) and hands per eval matchup.
     triad_eval_every_updates: int = 50
     triad_eval_hands: int = 1000
     # Main's opponent mix (must sum to 1.0).
@@ -343,8 +342,9 @@ class TrainConfig:
 
     # ---- MLflow tracking -------------------------------------------------
     # Set False to skip MLflow entirely (smoke tests, offline runs, or
-    # when the tracking server is down). All MLflow calls are also
-    # wrapped in _safe_mlflow so a runtime failure won't crash training.
+    # when the tracking server is down). All MLflow calls go through the
+    # train/mlflow_logging.py wrappers, so a runtime failure won't crash
+    # training.
     mlflow_enabled: bool = True
     # Experiment to log under. Defaults to mlflow_config.DEFAULT_EXPERIMENT
     # when None so the constant stays the single source of truth.
@@ -487,8 +487,7 @@ class RolloutBuffer:
         self.action_type = torch.empty((t, n), device=device, dtype=torch.int64)
         # Discrete raise-bucket index in [0, NUM_RAISE_BUCKETS). int64 storage so
         # the replay-time Categorical.log_prob is exactly the same as at sample
-        # time (no fp quantization to worry about — was a real bug for the old
-        # continuous raise_frac field).
+        # time (no fp quantization to worry about).
         self.raise_bucket = torch.empty((t, n), device=device, dtype=torch.int64)
         # Ratio-sensitive fields must stay in float32 regardless of the AMP
         # dtype used for scalar features. bf16 storage of logprob would quantize
@@ -687,7 +686,6 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
             max_opponents, device=device, dtype=torch.int64
         )  # 1=bot, 2=snapshot
 
-        # Initialize scores from pool
         for i, meta in enumerate(opponent_metas[:max_opponents]):
             opponent_scores[i] = (
                 float(meta.bb_per_hand)
@@ -778,8 +776,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                 opp_kind[idx[want_opponent]] = 0
                 opp_id[idx[want_opponent]] = 0
 
-        # Update global state
-        # Note: opp_kind/opp_id were updated in-place via slicing above
+        # opp_kind/opp_id were updated in place via slicing above.
 
     def _pick_snapshot_eval_ids(*, subset: int, k_recent: int = 4) -> list[int]:
         # Filter for snapshots only
@@ -1877,19 +1874,16 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                     if old_id in snapshot_models:
                         del snapshot_models[old_id]
 
-                # Update/Append meta
                 if idx < len(opponent_metas):
                     opponent_metas[idx] = meta
                 else:
                     opponent_metas.append(meta)
 
-                # Update tensors
                 if idx < max_opponents:
                     opponent_scores[idx] = 0.0  # Neutral start
                     opponent_kinds[idx] = 2
                     opponent_filled = max(opponent_filled, idx + 1)
 
-                # Cache new model
                 snapshot_models[meta.id] = copy.deepcopy(net)
                 snapshot_models[meta.id].eval()
 
@@ -1953,7 +1947,6 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                     else:
                         # Pick most recent snapshots by env_steps.
                         # We need to sort snap_indices by the env_steps of the meta.
-                        # Use metadata; snapshot_env_steps no longer exists.
                         sorted_snaps = sorted(
                             snap_indices,
                             key=lambda i: (
@@ -2287,14 +2280,12 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
     Simplifications vs ``_run_impl``:
       * AMP is honored but no GradScaler (we run bf16 by default; fp16
         with scaler can be added in a follow-up if V100 perf demands it).
-      * No torch.compile / cuda-graph paths (compile interacts poorly
-        with the per-role mutate_after_snapshot weight swap).
+      * No cuda-graph paths.
       * Diagnostics are role-prefixed but simplified to means rather
         than the on-device tensor accumulators used in ``_run_impl``.
-      * Async eval is stubbed: ME's WR-vs-current-Main is computed
-        synchronously every ``cfg.triad_eval_every_updates`` updates
-        from the rollout reward stream (no separate eval workers). LE
-        WR vs ALL is also seeded from rollout-time reward streams.
+      * Eval is synchronous: ME/LE win rate vs current Main is measured
+        every ``cfg.triad_eval_every_updates`` updates on a dedicated eval
+        env (no separate eval workers).
     """
     # ---- cfg normalization (mirrors _run_impl) -----------------------------
     cfg_dict = None
@@ -2427,7 +2418,7 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
         all_reset = torch.ones((sl.stop - sl.start,), device=device, dtype=torch.bool)
         _resample_for_role(role, all_reset)
 
-    # ---- Eval env (real async eval to replace wr_proxy) --------------------
+    # ---- Eval env ----------------------------------------------------------
     # Created lazily on first eval fire to avoid disturbing PyTorch's CUDA
     # allocator init path (the broken-NVML host crashes when a new Warp env
     # allocation arrives mid-training).
@@ -2481,9 +2472,8 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
         env_steps + cfg.save_every_env_steps if cfg.save_every_env_steps > 0 else 0
     )
 
-    # Cumulative per-role rollout-reward bookkeeping for the synchronous-eval
-    # stub: WR vs current main / WR vs all is approximated from the per-role
-    # reward stream. T7 will replace this with proper async evals.
+    # Cumulative per-role terminal-reward bookkeeping, logged as
+    # terminal_reward_mean / terminal_hands_count.
     role_reward_sum: dict[str, float] = dict.fromkeys(ROLES, 0.0)
     role_reward_count: dict[str, float] = dict.fromkeys(ROLES, 0.0)
 
@@ -2719,8 +2709,8 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
         t_phase_rollout = _t_now() - _t_rollout_start
 
         # ---- PPO update: per-role GAE returns + advantages ---------------
-        # Fix for the EV-collapse bug: triad previously used MC returns
-        # (terminal-only, high-variance). Now uses GAE on per-step values.
+        # Returns use GAE on per-step values (MC returns are terminal-only
+        # and high-variance, which collapses explained variance).
         # The rollout populates rs.buf.value only for learner-actor steps;
         # we backfill values for opponent-actor steps via a post-hoc no-grad
         # forward through the role's net so GAE has a valid bootstrap at
@@ -2821,7 +2811,7 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
             adv_by_role[role] = adv_norm
             mask_by_role[role] = train_mask
 
-            # Accumulate role reward stats (for the synchronous WR-stub).
+            # Accumulate per-role terminal reward stats.
             terminal_rewards = rs.buf.reward_p0[rs.buf.done.to(dtype=torch.bool)]
             if terminal_rewards.numel() > 0:
                 role_reward_sum[role] += float(terminal_rewards.sum().item())
@@ -2838,10 +2828,10 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
             )
         t_phase_ppo = _t_now() - _t_ppo_start
 
-        # ---- Real eval: ME/LE vs current Main (every triad_eval_every_updates)
-        # Replaces the prior sigmoid-of-reward proxy with actual hand-by-hand
-        # play. Promotes ME/LE snapshots only when their REAL win rate vs the
-        # main agent crosses triad_me_promote_wr / triad_le_promote_wr.
+        # ---- Eval: ME/LE vs current Main (every triad_eval_every_updates)
+        # Hand-by-hand play against Main. Promotes ME/LE snapshots only when
+        # their measured win rate vs the main agent crosses
+        # triad_me_promote_wr / triad_le_promote_wr.
         _t_eval_start = _t_now()
         triad_eval_every = max(1, int(cfg.triad_eval_every_updates))
         if (update + 1) % triad_eval_every == 0:
@@ -2879,9 +2869,9 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
                     )
                     bb_b = -float(m_b.get("bb_per_hand", 0.0))
                     bb_avg = 0.5 * (bb_a + bb_b)
-                    # Map bb/hand -> [0, 1] WR via same sigmoid as the old
-                    # proxy so triad_me_promote_wr=0.70 (etc.) keeps its
-                    # configured semantics. sigmoid(5x) crosses 0.7 at
+                    # Map bb/hand -> [0, 1] WR via a sigmoid so the promote
+                    # thresholds (e.g. triad_me_promote_wr=0.70) are
+                    # win-rate-like. sigmoid(5x) crosses 0.7 at
                     # bb_per_hand ~= 0.17 = +17 bb/100.
                     wr = float(torch.sigmoid(torch.tensor(bb_avg * 5.0)).item())
                     rs.eval_wr_vs_targets["main_current"] = wr
@@ -2936,7 +2926,7 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
                 )
 
         # ---- ME forced periodic reset (AlphaStar §3 stalling fix) --------
-        # Counters the [[me-exploiter-stalling]] failure mode: once Main
+        # Counters a stalling failure mode: once Main
         # catches up to ME, ME's WR collapses below triad_me_promote_wr
         # and the WR-gated snapshot/mutate path stops firing. Without a
         # forced reset, ME stays frozen indefinitely. No-op when

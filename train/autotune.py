@@ -347,9 +347,6 @@ def autotune_num_envs(
     return rec
 
 
-# --- legacy API kept for backwards compatibility (used by older callers) ---
-
-
 def _try_alloc(  # noqa: PLR0913
     *,
     device: str,
@@ -363,7 +360,7 @@ def _try_alloc(  # noqa: PLR0913
     head_layers: int,
     head_dim: int | None,
 ) -> bool:
-    """Legacy single-net OK/fail probe. Prefer ``probe_peak``+``autotune_num_envs``."""
+    """Single-net OK/fail probe. Prefer ``probe_peak``+``autotune_num_envs``."""
     peak = probe_peak(
         device=device,
         num_envs=num_envs,
