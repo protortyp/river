@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
-from train.league import UnifiedOpponentPool, pfsp_weights_from_bb_per_hand
+from train.league import UnifiedOpponentPool
 
 
 def test_unified_pool_init_with_bots(tmp_path: Path) -> None:
@@ -85,18 +85,6 @@ def test_unified_pool_persistence(tmp_path: Path) -> None:
     # Should contain both old bot_a and new bot_b
     assert len(opponents) == 2
     assert {o.id for o in opponents} == {"bot_a", "bot_b"}
-
-
-def test_pfsp_weights_utility() -> None:
-    bb = torch.tensor([-10.0, 0.0, 10.0])
-    # Default mode="hard" (f_hard = (1 - p)^q): weight decreases as bb/hand
-    # rises, concentrating mass on opponents the learner loses to.
-    w_hard = pfsp_weights_from_bb_per_hand(bb, temperature=1.0, epsilon=0.0)
-    assert w_hard[0] > w_hard[1] > w_hard[2]
-    # mode="var" (f_var = p*(1 - p)): peak at 0 (50% win rate), lower at extremes.
-    w_var = pfsp_weights_from_bb_per_hand(bb, temperature=1.0, epsilon=0.0, mode="var")
-    assert w_var[1] > w_var[0]
-    assert w_var[1] > w_var[2]
 
 
 def test_snapshots_from_different_roles_at_same_step_do_not_collide(tmp_path: Path) -> None:

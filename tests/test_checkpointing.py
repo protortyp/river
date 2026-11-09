@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-import pytest
 import torch
 from train.checkpointing import CheckpointState, load_checkpoint, save_checkpoint
 
@@ -61,10 +59,6 @@ def test_checkpoint_load_accepts_non_tensor_rng_state(tmp_path: Path) -> None:
     assert st.env_steps == 1
 
 
-@pytest.mark.skipif(
-    not os.path.exists("src/gpu_poker/lookup_data/hand_ranks.npz"),
-    reason="no lookup data",
-)
 def test_train_save_and_resume_checkpoint_cpu(tmp_path: Path) -> None:
     # Load the real config file, but do not resolve Hydra interpolations like `${now:...}`.
     from omegaconf import OmegaConf

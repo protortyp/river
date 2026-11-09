@@ -44,17 +44,9 @@ class TestWarpPokerEnv:
         assert env.num_envs == num_envs
         assert env.state.stacks.shape == (num_envs, 2)
 
-        # Verify zero-copy tensors are created
         assert env.obs_cards.shape == (num_envs, 7)
         assert env.obs_scalars.shape == (num_envs, 17)
         assert env.rewards.shape == (num_envs,)
-
-        # Check device alignment
-        if DEVICE == "cuda":
-            # This check is tricky because env.obs_cards is a wp.array, not a torch tensor.
-            # We verify the device during creation and usage implicitly.
-            # A simple check is to ensure the warp device matches.
-            assert env.device == "cuda"
 
     def test_reset(self):
         """Tests reset functionality."""

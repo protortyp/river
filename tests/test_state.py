@@ -263,12 +263,6 @@ class TestState:
             # P0: AA
             # P1: KK
 
-            # Helper to set cards... skipping precise card setting for brevity
-            # and trusting the evaluator test.
-            # We will force the result by mocking the resolve function logic?
-            # No, we can't mock inside a kernel.
-            # We must set actual cards that result in a win.
-
             # P0: Ace Spades (51), Ace Hearts (38)
             s.hole_cards[tid, 0, 0] = 51
             s.hole_cards[tid, 0, 1] = 38

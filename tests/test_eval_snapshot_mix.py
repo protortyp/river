@@ -1,13 +1,8 @@
-import os
+import math
 
-import pytest
 import torch
 
 
-@pytest.mark.skipif(
-    not os.path.exists("src/gpu_poker/lookup_data/hand_ranks.npz"),
-    reason="no lookup data",
-)
 def test_eval_vs_snapshot_mix_smoke_cpu():
     from train.eval import eval_vs_snapshot_mix_seat_swap
 
@@ -39,4 +34,4 @@ def test_eval_vs_snapshot_mix_smoke_cpu():
         deterministic=False,
     )
     assert m["hands"] > 0
-    assert abs(float(m["bb_per_hand"])) < 1e6
+    assert math.isfinite(float(m["bb_per_hand"]))

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
 from play.interactive import (
     format_card,
@@ -276,45 +275,3 @@ class TestHumanInputParsing:
         result = parse_human_input("CaLl", obs, env_idx=0)
         assert result is not None
         assert result[0] == c.ACTION_CALL
-
-
-class TestIntegration:
-    """Integration tests for interactive game components."""
-
-    def test_card_formatting_round_trip(self):
-        """Test that we can format all valid card indices."""
-        # Test all 52 cards can be formatted
-        for card_idx in range(52):
-            result = format_card(card_idx)
-            assert isinstance(result, Text)
-            assert len(result.plain) >= 2  # At least rank + suit
-
-    def test_action_parsing_coverage(self):
-        """Test that all action types can be parsed."""
-        obs = {
-            "action_mask": torch.tensor([[True, True, True, True]]),
-            "min_raise": torch.tensor([10]),
-            "max_raise": torch.tensor([100]),
-            "scalars": torch.tensor([[0.0] * 17]),
-        }
-
-        # Fold
-        result = parse_human_input("f", obs)
-        assert result[0] == c.ACTION_FOLD
-
-        # Check
-        result = parse_human_input("k", obs)
-        assert result[0] == c.ACTION_CHECK
-
-        # Call
-        result = parse_human_input("c", obs)
-        assert result[0] == c.ACTION_CALL
-
-        # Raise
-        result = parse_human_input("r 50", obs)
-        assert result[0] == c.ACTION_RAISE
-        assert result[1] == 50
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

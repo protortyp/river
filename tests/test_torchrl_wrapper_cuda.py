@@ -1,12 +1,6 @@
-import os
-
 import pytest
 
 
-@pytest.mark.skipif(
-    not os.path.exists("src/gpu_poker/lookup_data/hand_ranks.npz"),
-    reason="no lookup data",
-)
 def test_torchrl_wrapper_cuda_smoke():
     try:
         import torch

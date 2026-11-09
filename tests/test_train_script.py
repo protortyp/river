@@ -1,5 +1,3 @@
-import os
-
 import pytest
 import torch
 
@@ -54,10 +52,6 @@ def test_self_play_gae_keeps_bootstrap_sign_for_same_player_perspective():
     assert torch.allclose(returns, torch.tensor([[10.0]]))
 
 
-@pytest.mark.skipif(
-    not os.path.exists("src/gpu_poker/lookup_data/hand_ranks.npz"),
-    reason="no lookup data",
-)
 def test_train_script_cpu_one_update_smoke():
     from train.train import TrainConfig, run
 
@@ -123,10 +117,6 @@ def test_train_script_cpu_one_update_smoke():
     assert result.overall_sps > 0
 
 
-@pytest.mark.skipif(
-    not os.path.exists("src/gpu_poker/lookup_data/hand_ranks.npz"),
-    reason="no lookup data",
-)
 def test_train_script_cpu_transformer_smoke():
     """End-to-end smoke for the transformer backbone: one full rollout +
     PPO update must finish without NaN/crash, exercising the action-token
@@ -203,10 +193,6 @@ def test_train_script_cpu_transformer_smoke():
     assert result.overall_sps > 0
 
 
-@pytest.mark.skipif(
-    not os.path.exists("src/gpu_poker/lookup_data/hand_ranks.npz"),
-    reason="no lookup data",
-)
 def test_train_script_cpu_league_smoke():
     from train.train import TrainConfig, run
 
@@ -371,7 +357,6 @@ def test_train_script_cpu_triad_mlflow_smoke(tmp_path):
     the production test_train_script_cpu_triad_smoke covers correctness
     of the training loop independently.
     """
-    import pytest
 
     pytest.importorskip("mlflow")
     import socket
