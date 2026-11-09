@@ -76,7 +76,6 @@ export function newHand({
     pot: 0, // pot accumulates between streets; current street's chips live in `bets`
     hole_cards: holeCards,
     community_cards: community.slice(),
-    visible_community: 0, // how many community cards are revealed
     last_raise: bigBlind, // initial min-raise is BB
     num_raises: 0,
     last_aggressor: -1,
@@ -94,22 +93,7 @@ export function newHand({
     rewards: [0, 0], // chip delta per player for this hand
   };
 
-  // Mask the community cards based on stage (only flop visible at FLOP, etc.).
-  applyVisibility(state);
-
   return state;
-}
-
-/**
- * Returns the slice of community cards that should be visible per
- * `state.visible_community`, plus -1 for hidden slots. This is the format the
- * obs encoder consumes (community_cards[i] = -1 if not yet dealt).
- */
-function applyVisibility(state) {
-  const visible = STAGE_COMMUNITY_COUNT[state.stage];
-  state.visible_community = visible;
-  // The actual community array stays full (we need it to deal further); the
-  // state returned to the encoder will be derived via stateForEncoder().
 }
 
 /** Returns the state in the exact shape encodeObs() expects. */
@@ -217,7 +201,6 @@ function advanceStage(state) {
   // BB acts first postflop.
   if (state.stage !== STAGE_SHOWDOWN) {
     state.active_player = 1 - state.button;
-    applyVisibility(state);
   }
 
   // If both players are all-in, skip straight to showdown by running
@@ -228,7 +211,6 @@ function advanceStage(state) {
       else if (state.stage === STAGE_TURN) state.stage = STAGE_RIVER;
       else if (state.stage === STAGE_RIVER) state.stage = STAGE_SHOWDOWN;
     }
-    applyVisibility(state);
   }
 
   if (state.stage === STAGE_SHOWDOWN) resolveShowdown(state);

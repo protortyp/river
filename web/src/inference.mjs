@@ -82,9 +82,6 @@ export class PokerBot {
     // Per-model: filled at loadModel() time from ONNX metadata.
     this.backbone = "lstm";
     this.stateWidth = LSTM_HIDDEN_DEFAULT;
-    // Backwards-compat alias kept so older callers (engine.mjs, smoke.mjs)
-    // that reference bot.lstmHidden don't break.
-    this.lstmHidden = LSTM_HIDDEN_DEFAULT;
   }
 
   /** Load a model from a File (drag-and-drop), URL, or ArrayBuffer. */
@@ -141,7 +138,6 @@ export class PokerBot {
       this.backbone = "lstm";
       this.stateWidth = LSTM_HIDDEN_DEFAULT;
     }
-    this.lstmHidden = this.stateWidth; // backwards-compat alias
 
     this.resetHidden();
   }

@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "smoke": "node smoke.mjs",
+    "pretest": "cd .. && uv run python train/dump_obs_fixtures.py --out web/tests/fixtures.json",
     "test": "node tests/encoder.test.mjs && node tests/engine.test.mjs && node --test tests/inference_pushtoken.test.mjs tests/inference_onnx_load.test.mjs"
   },
   "dependencies": {

@@ -4,10 +4,10 @@
 // onnxruntime-web runtime can't parse (e.g. the "protobuf parsing
 // failed" error users see in the UI).
 //
-// The fixture is checked in as tests/fixtures.onnx -- regenerate via:
+// tests/fixtures.onnx is gitignored; generate it with:
 //
 //     uv run python train/export_onnx.py --checkpoint X.pt \
-//       --config /tmp/triad_arch.yaml --out web/tests/fixtures.onnx
+//       --out web/tests/fixtures.onnx
 //
 // If you change the export format or upgrade onnxruntime-web, run this
 // test FIRST to catch the regression before users hit the drag-and-drop
