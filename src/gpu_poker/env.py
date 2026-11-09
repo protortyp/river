@@ -121,36 +121,10 @@ def step_kernel_per_env(
 
 
 @wp.kernel
-def get_obs_kernel(
-    game_state: GameState,
-    obs_cards: wp.array(dtype=wp.int32, ndim=2),
-    obs_scalars: wp.array(dtype=wp.float32, ndim=2),
-    primes: wp.array(dtype=wp.int32),
-    unsuited_lut: wp.array(dtype=wp.int16),
-    flush_lut: wp.array(dtype=wp.int16),
-):
-    """Observation kernel - extracts observations for all environments."""
-    env_idx = wp.tid()
-
-    observations.write_observation(
-        game_state,
-        env_idx,
-        obs_cards,
-        obs_scalars,
-        primes,
-        unsuited_lut,
-        flush_lut,
-    )
-
-
-@wp.kernel
 def get_obs_legal_kernel(
     game_state: GameState,
     obs_cards: wp.array(dtype=wp.int32, ndim=2),
     obs_scalars: wp.array(dtype=wp.float32, ndim=2),
-    primes: wp.array(dtype=wp.int32),
-    unsuited_lut: wp.array(dtype=wp.int16),
-    flush_lut: wp.array(dtype=wp.int16),
     action_mask: wp.array(dtype=wp.bool, ndim=2),
     min_raise: wp.array(dtype=wp.int32),
     max_raise: wp.array(dtype=wp.int32),
@@ -161,21 +135,7 @@ def get_obs_legal_kernel(
         env_idx,
         obs_cards,
         obs_scalars,
-        primes,
-        unsuited_lut,
-        flush_lut,
     )
-    legal_actions.write_legal_actions(game_state, env_idx, action_mask, min_raise, max_raise)
-
-
-@wp.kernel
-def get_legal_kernel(
-    game_state: GameState,
-    action_mask: wp.array(dtype=wp.bool, ndim=2),
-    min_raise: wp.array(dtype=wp.int32),
-    max_raise: wp.array(dtype=wp.int32),
-):
-    env_idx = wp.tid()
     legal_actions.write_legal_actions(game_state, env_idx, action_mask, min_raise, max_raise)
 
 
@@ -187,18 +147,6 @@ def clear_step_flags_kernel(
     i = wp.tid()
     invalid_action[i] = False
     terminated[i] = False
-
-
-@wp.kernel
-def reset_kernel(
-    game_state: GameState,
-    starting_stack: wp.int32,
-    small_blind: wp.int32,
-    big_blind: wp.int32,
-):
-    """Reset kernel - initializes all environments."""
-    env_idx = wp.tid()
-    state.reset_env(game_state, env_idx, starting_stack, small_blind, big_blind)
 
 
 @wp.kernel
@@ -426,9 +374,6 @@ class WarpPokerEnv:
                 self.state,
                 self.obs_cards,
                 self.obs_scalars,
-                self.primes,
-                self.unsuited_lut,
-                self.flush_lut,
                 self.action_mask,
                 self.min_raise,
                 self.max_raise,
@@ -541,9 +486,6 @@ class WarpPokerEnv:
                 self.state,
                 self.obs_cards,
                 self.obs_scalars,
-                self.primes,
-                self.unsuited_lut,
-                self.flush_lut,
                 self.action_mask,
                 self.min_raise,
                 self.max_raise,
@@ -611,9 +553,6 @@ class WarpPokerEnv:
                 self.state,
                 self.obs_cards,
                 self.obs_scalars,
-                self.primes,
-                self.unsuited_lut,
-                self.flush_lut,
                 self.action_mask,
                 self.min_raise,
                 self.max_raise,

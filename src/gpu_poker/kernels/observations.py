@@ -54,9 +54,6 @@ def write_observation(
     env_idx: wp.int32,
     obs_cards: wp.array(dtype=wp.int32, ndim=2),
     obs_scalars: wp.array(dtype=wp.float32, ndim=2),
-    primes: wp.array(dtype=wp.int32),
-    unsuited_lut: wp.array(dtype=wp.int16),
-    flush_lut: wp.array(dtype=wp.int16),
 ):
     """
     Extracts observation for the active player and writes directly to output arrays.

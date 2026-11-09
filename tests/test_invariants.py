@@ -187,18 +187,11 @@ class TestInvariants:
         obs_cards = wp.zeros((1, 7), dtype=wp.int32, device=DEVICE)
         obs_scalars = wp.zeros((1, 17), dtype=wp.float32, device=DEVICE)
 
-        primes = wp.zeros(13, dtype=wp.int32, device=DEVICE)
-        unsuited = wp.zeros(1, dtype=wp.int16, device=DEVICE)
-        flush = wp.zeros(1, dtype=wp.int16, device=DEVICE)
-
         @wp.kernel
         def kernel(
             s: GameState,
             obs_cards: wp.array(dtype=wp.int32, ndim=2),
             obs_scalars: wp.array(dtype=wp.float32, ndim=2),
-            primes: wp.array(dtype=wp.int32),
-            unsuited: wp.array(dtype=wp.int16),
-            flush: wp.array(dtype=wp.int16),
         ):
             tid = wp.tid()
             s.active_player[tid] = 0
@@ -207,9 +200,9 @@ class TestInvariants:
             s.stacks[tid, 1] = 100
             s.bets[tid, 0] = 0
             s.bets[tid, 1] = 10
-            observations.write_observation(s, tid, obs_cards, obs_scalars, primes, unsuited, flush)
+            observations.write_observation(s, tid, obs_cards, obs_scalars)
 
-        wp.launch(kernel, dim=1, inputs=[s, obs_cards, obs_scalars, primes, unsuited, flush])
+        wp.launch(kernel, dim=1, inputs=[s, obs_cards, obs_scalars])
         assert obs_scalars.numpy()[0, 6] == 0.0
 
     def test_observation_to_call_clipped_when_facing_overbet(self):
@@ -222,18 +215,11 @@ class TestInvariants:
         obs_cards = wp.zeros((1, 7), dtype=wp.int32, device=DEVICE)
         obs_scalars = wp.zeros((1, 17), dtype=wp.float32, device=DEVICE)
 
-        primes = wp.zeros(13, dtype=wp.int32, device=DEVICE)
-        unsuited = wp.zeros(1, dtype=wp.int16, device=DEVICE)
-        flush = wp.zeros(1, dtype=wp.int16, device=DEVICE)
-
         @wp.kernel
         def kernel(
             s: GameState,
             obs_cards: wp.array(dtype=wp.int32, ndim=2),
             obs_scalars: wp.array(dtype=wp.float32, ndim=2),
-            primes: wp.array(dtype=wp.int32),
-            unsuited: wp.array(dtype=wp.int16),
-            flush: wp.array(dtype=wp.int16),
         ):
             tid = wp.tid()
             s.active_player[tid] = 0
@@ -244,9 +230,9 @@ class TestInvariants:
             s.stacks[tid, 1] = 1000
             s.bets[tid, 0] = 0
             s.bets[tid, 1] = 200
-            observations.write_observation(s, tid, obs_cards, obs_scalars, primes, unsuited, flush)
+            observations.write_observation(s, tid, obs_cards, obs_scalars)
 
-        wp.launch(kernel, dim=1, inputs=[s, obs_cards, obs_scalars, primes, unsuited, flush])
+        wp.launch(kernel, dim=1, inputs=[s, obs_cards, obs_scalars])
         val = float(obs_scalars.numpy()[0, 6])
         # Before the fix: 200/50 = 4.0. After: clamped to 50/50 = 1.0.
         assert val == 1.0, f"to_call/stack should clip to 1.0, got {val}"
