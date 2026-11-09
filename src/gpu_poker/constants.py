@@ -1,10 +1,4 @@
-"""
-Core constants and enumerations for GPU poker environment.
-
-All constants use Warp-compatible types (wp.int32, wp.float32).
-"""
-
-import warp as wp
+"""Core constants and enumerations for the GPU poker environment."""
 
 # =============================================================================
 # Card Representation
@@ -24,36 +18,6 @@ HOLE_CARDS: int = 2
 
 # Maximum community cards (5: flop + turn + river)
 COMMUNITY_CARDS: int = 5
-
-# Cards needed for evaluation (hole + community)
-MAX_EVAL_CARDS: int = 7
-
-# =============================================================================
-# Rank Constants (0-12)
-# =============================================================================
-
-RANK_2: int = 0
-RANK_3: int = 1
-RANK_4: int = 2
-RANK_5: int = 3
-RANK_6: int = 4
-RANK_7: int = 5
-RANK_8: int = 6
-RANK_9: int = 7
-RANK_T: int = 8
-RANK_J: int = 9
-RANK_Q: int = 10
-RANK_K: int = 11
-RANK_A: int = 12
-
-# =============================================================================
-# Suit Constants (0-3)
-# =============================================================================
-
-SUIT_CLUBS: int = 0
-SUIT_DIAMONDS: int = 1
-SUIT_HEARTS: int = 2
-SUIT_SPADES: int = 3
 
 # =============================================================================
 # Game Stage Constants
@@ -89,10 +53,6 @@ NUM_PLAYERS: int = 2
 PLAYER_0: int = 0
 PLAYER_1: int = 1
 
-# Player positions
-POSITION_SB: int = 0  # Small blind / button in heads-up
-POSITION_BB: int = 1  # Big blind
-
 # Invalid player marker
 INVALID_PLAYER: int = -1
 
@@ -110,48 +70,12 @@ BIG_BLIND: int = 2
 # Starting stack (in chips)
 STARTING_STACK: int = 1000
 
-# Minimum raise amount (must raise at least the previous raise amount)
-MIN_RAISE_MULTIPLIER: int = 2
-
 # =============================================================================
 # Array Shape Constants
 # =============================================================================
 
 # Default number of parallel environments
 DEFAULT_NUM_ENVS: int = 131072  # 128K environments
-
-# Maximum number of actions per hand (conservative estimate)
-MAX_ACTIONS_PER_HAND: int = 100
-
-# =============================================================================
-# Warp Type Aliases
-# =============================================================================
-
-# Integer types
-Int32 = wp.int32
-UInt32 = wp.uint32
-Int64 = wp.int64
-
-# Float types
-Float32 = wp.float32
-Float64 = wp.float64
-
-# Boolean type
-Bool = wp.bool
-
-# =============================================================================
-# Hand Rank Constants (for evaluator)
-# =============================================================================
-
-HAND_HIGH_CARD: int = 0
-HAND_PAIR: int = 1
-HAND_TWO_PAIR: int = 2
-HAND_THREE_OF_KIND: int = 3
-HAND_STRAIGHT: int = 4
-HAND_FLUSH: int = 5
-HAND_FULL_HOUSE: int = 6
-HAND_FOUR_OF_KIND: int = 7
-HAND_STRAIGHT_FLUSH: int = 8
 
 # =============================================================================
 # Prime Numbers for Cactus Kev Evaluator
@@ -180,4 +104,3 @@ RANK_PRIMES: tuple[int, ...] = (
 
 INVALID_CARD: int = -1
 INVALID_ACTION: int = -1
-INVALID_STAGE: int = -1
