@@ -87,26 +87,21 @@ def validate_action(
         # 3. Raise size must be valid
         # 'amount' here usually implies the amount ADDED on top of the call
         # Min raise is usually the size of the previous raise (or BB)
-        min_raise = state.last_raise[env_idx]
-        bb = state.cfg_big_blind[env_idx]
-        if bb <= 0:
-            bb = c.BIG_BLIND
-        if min_raise < bb:
-            min_raise = bb
+        min_raise = min_raise_delta(state, env_idx)
 
         if amount < min_raise and amount != (stack - to_call):
             return False
         # All-in-for-less is the only sub-min exception; it still must respect
         # the effective-stack cap (opponent's max total). For full raises, also
         # enforce the upper bound here.
-        max_raise = _max_raise_delta(state, env_idx, player_idx)
+        max_raise = max_raise_delta(state, env_idx, player_idx)
         return amount <= max_raise
 
     return False
 
 
 @wp.func
-def _min_raise_delta(state: GameState, env_idx: wp.int32) -> wp.int32:
+def min_raise_delta(state: GameState, env_idx: wp.int32) -> wp.int32:
     m = state.last_raise[env_idx]
     bb = state.cfg_big_blind[env_idx]
     if bb <= 0:
@@ -117,7 +112,7 @@ def _min_raise_delta(state: GameState, env_idx: wp.int32) -> wp.int32:
 
 
 @wp.func
-def _max_raise_delta(state: GameState, env_idx: wp.int32, player: wp.int32) -> wp.int32:
+def max_raise_delta(state: GameState, env_idx: wp.int32, player: wp.int32) -> wp.int32:
     opp = 1 - player
     to_call = get_to_call(state, env_idx, player)
     player_stack = state.stacks[env_idx, player]
@@ -215,8 +210,8 @@ def force_legal_action(
                 return _pack_action(invalid, c.ACTION_CALL, 0)
             return _pack_action(invalid, c.ACTION_CHECK, 0)
 
-        min_d = _min_raise_delta(state, env_idx)
-        max_d = _max_raise_delta(state, env_idx, player_idx)
+        min_d = min_raise_delta(state, env_idx)
+        max_d = max_raise_delta(state, env_idx, player_idx)
         all_in_delta = player_stack - to_call
 
         # If opponent can't match any raise (or we can't), fall back.
@@ -316,12 +311,7 @@ def apply_action(
             # NOT update the min-raise reference (it does not reopen action for
             # players already past). Only "full" raises (>= prior min) update
             # last_raise. Always advance aggressor and counter.
-            prior_min = state.last_raise[env_idx]
-            bb = state.cfg_big_blind[env_idx]
-            if bb <= 0:
-                bb = c.BIG_BLIND
-            if prior_min < bb:
-                prior_min = bb
+            prior_min = min_raise_delta(state, env_idx)
             if actual_raise >= prior_min:
                 state.last_raise[env_idx] = actual_raise
             state.last_aggressor[env_idx] = player_idx
