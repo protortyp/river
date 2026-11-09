@@ -59,6 +59,17 @@ from train.league import (  # noqa: E402
     UnifiedOpponentPool,
     pfsp_weights_from_bb_per_hand,
 )
+from train.ppo_utils import (  # noqa: E402
+    action_stats,
+    action_stats_by_street,
+    action_stats_masked,
+    assert_finite,
+    compute_gae,
+    compute_mc_returns_p0,
+    scatter_player_state,
+    select_player_state,
+    sync,
+)
 from train.triad import (  # noqa: E402
     OPP_LIVE_MAIN,
     OPP_SELF,
@@ -97,28 +108,6 @@ except ModuleNotFoundError:  # pragma: no cover
     ConfigStore = None  # type: ignore[assignment]
     OmegaConf = None  # type: ignore[assignment]
     _HAS_HYDRA = False
-
-
-def _default_device() -> str:
-    return "cuda:0" if torch.cuda.is_available() else "cpu"
-
-
-def _sync(device: str) -> None:
-    if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
-def _debug_numeric_enabled() -> bool:
-    return os.environ.get("POKERGPU_DEBUG_NUMERIC", "0") == "1"
-
-
-def _assert_finite(name: str, x: torch.Tensor) -> None:
-    if not _debug_numeric_enabled():
-        return
-    if torch.isfinite(x).all():
-        return
-    bad = (~torch.isfinite(x)).sum().item()
-    raise RuntimeError(f"Non-finite tensor: {name} (bad={bad}, shape={tuple(x.shape)})")
 
 
 # Either policy backbone. Both expose the same forward_step / evaluate_step /
@@ -521,154 +510,6 @@ class RolloutBuffer:
         self.c = torch.empty((t, n, hidden), device=device, dtype=torch.float32)
 
 
-def _bucket_stats(raise_bucket_1d: torch.Tensor) -> dict[str, float]:
-    """Per-bucket fraction of raise actions (raise_bucket: [K] int64 in [0, B))."""
-    out: dict[str, float] = {}
-    if raise_bucket_1d.numel() == 0:
-        for b in range(NUM_RAISE_BUCKETS):
-            out[f"bucket_{b}_pct"] = 0.0
-        return out
-    total = float(raise_bucket_1d.numel())
-    for b in range(NUM_RAISE_BUCKETS):
-        out[f"bucket_{b}_pct"] = float(raise_bucket_1d.eq(b).sum().item()) / total
-    return out
-
-
-def _action_stats(action_type: torch.Tensor, raise_bucket: torch.Tensor) -> dict[str, float]:
-    # action_type: [T,N] int64, raise_bucket: [T,N] int64
-    t, n = action_type.shape
-    total = float(t * n)
-    counts = {}
-    for a in (c.ACTION_FOLD, c.ACTION_CHECK, c.ACTION_CALL, c.ACTION_RAISE):
-        counts[a] = float(action_type.eq(a).sum().item())
-    raise_mask = action_type.eq(c.ACTION_RAISE)
-    rb = raise_bucket.squeeze(-1) if raise_bucket.ndim > 2 else raise_bucket
-    rb_at_raise = rb[raise_mask]
-    out = {
-        "pct_fold": counts[c.ACTION_FOLD] / total,
-        "pct_check": counts[c.ACTION_CHECK] / total,
-        "pct_call": counts[c.ACTION_CALL] / total,
-        "pct_raise": counts[c.ACTION_RAISE] / total,
-    }
-    out.update(_bucket_stats(rb_at_raise))
-    return out
-
-
-def _action_stats_masked(
-    action_type: torch.Tensor, raise_bucket: torch.Tensor, mask: torch.Tensor
-) -> dict[str, float]:
-    # action_type: [T,N] int64, raise_bucket: [T,N] int64, mask: [T,N] bool
-    mask = mask.to(dtype=torch.bool)
-    total = float(mask.sum().item())
-    if total <= 0:
-        out = {
-            "pct_fold": 0.0,
-            "pct_check": 0.0,
-            "pct_call": 0.0,
-            "pct_raise": 0.0,
-        }
-        out.update(_bucket_stats(torch.empty(0, dtype=torch.int64)))
-        return out
-    at = action_type[mask]
-    rb = raise_bucket.squeeze(-1) if raise_bucket.ndim > 2 else raise_bucket
-    rb_all = rb[mask]
-    counts = {}
-    for a in (c.ACTION_FOLD, c.ACTION_CHECK, c.ACTION_CALL, c.ACTION_RAISE):
-        counts[a] = float(at.eq(a).sum().item())
-    raise_mask = at.eq(c.ACTION_RAISE)
-    rb_at_raise = rb_all[raise_mask]
-    out = {
-        "pct_fold": counts[c.ACTION_FOLD] / total,
-        "pct_check": counts[c.ACTION_CHECK] / total,
-        "pct_call": counts[c.ACTION_CALL] / total,
-        "pct_raise": counts[c.ACTION_RAISE] / total,
-    }
-    out.update(_bucket_stats(rb_at_raise))
-    return out
-
-
-def _action_stats_by_street(
-    *,
-    action_type: torch.Tensor,  # [T,N]
-    raise_bucket: torch.Tensor,  # [T,N]
-    scalars: torch.Tensor,  # [T,N,S]
-    base_mask: torch.Tensor,  # [T,N] bool
-) -> dict[str, dict[str, float]]:
-    # scalars[...,7] is stage normalized by 5.0; map back to int stage.
-    stage = (scalars[..., 7] * 5.0).round().to(dtype=torch.int64).clamp_(0, 5)
-    out: dict[str, dict[str, float]] = {}
-    for name, st in [
-        ("preflop", c.STAGE_PREFLOP),
-        ("flop", c.STAGE_FLOP),
-        ("turn", c.STAGE_TURN),
-        ("river", c.STAGE_RIVER),
-    ]:
-        m = base_mask & stage.eq(int(st))
-        out[name] = _action_stats_masked(action_type, raise_bucket, m)
-    return out
-
-
-def _compute_gae(
-    *,
-    rewards: torch.Tensor,  # [T,B]
-    dones: torch.Tensor,  # [T,B] bool
-    values: torch.Tensor,  # [T,B]
-    last_value: torch.Tensor,  # [B]
-    player_id: torch.Tensor,  # [T,B] int, value perspective for each timestep
-    last_player_id: torch.Tensor,  # [B] int, value perspective for last_value
-    gamma: float,
-    gae_lambda: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    t_steps, batch = rewards.shape
-    advantages = torch.zeros((t_steps, batch), device=rewards.device, dtype=torch.float32)
-    gae = torch.zeros((batch,), device=rewards.device, dtype=torch.float32)
-    next_value = last_value
-    for t in range(t_steps - 1, -1, -1):
-        not_done = (~dones[t]).to(dtype=torch.float32)
-        next_player = last_player_id if t == t_steps - 1 else player_id[t + 1]
-        perspective_sign = torch.where(
-            next_player.eq(player_id[t]),
-            torch.ones((batch,), device=rewards.device, dtype=torch.float32),
-            -torch.ones((batch,), device=rewards.device, dtype=torch.float32),
-        )
-        delta = rewards[t] + gamma * not_done * perspective_sign * next_value - values[t]
-        gae = delta + gamma * gae_lambda * not_done * perspective_sign * gae
-        advantages[t] = gae
-        next_value = values[t]
-    returns = advantages + values
-    return advantages, returns
-
-
-def _compute_mc_returns_p0(
-    *,
-    reward_p0: torch.Tensor,  # [T,N] float32 terminal-only (0 otherwise)
-    dones: torch.Tensor,  # [T,N] bool
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Monte-Carlo episode returns from the P0 perspective.
-
-    Used for league training where the opponent may be a different policy. Since env
-    observations are active-player (include the acting player's private hole cards),
-    we avoid requiring value targets on opponent-to-act states to prevent information leaks.
-
-    Returns:
-      returns_p0: [T,N] terminal return propagated backward within the rollout
-      valid:      [T,N] True if the episode terminates within the rollout window
-    """
-    t_steps, n = reward_p0.shape
-    returns = torch.zeros_like(reward_p0)
-    valid = torch.zeros_like(dones)
-    ret = torch.zeros((n,), device=reward_p0.device, dtype=torch.float32)
-    has = torch.zeros((n,), device=reward_p0.device, dtype=torch.bool)
-    for t in range(t_steps - 1, -1, -1):
-        term = dones[t]
-        ret = torch.where(term, reward_p0[t], ret)
-        has = term | has
-        returns[t] = ret
-        valid[t] = has
-    return returns, valid
-
-
 def _push_transformer_token(
     h0: torch.Tensor,
     h1: torch.Tensor,
@@ -706,40 +547,6 @@ def _stage_from_scalars(scalars: torch.Tensor) -> torch.Tensor:
     The observation kernel writes `scalars[:, 7] = state.stage / 5.0`.
     """
     return (scalars[..., 7] * 5.0).round().to(dtype=torch.int32)
-
-
-def _select_player_state(
-    *,
-    player_id: torch.Tensor,
-    h0: torch.Tensor,
-    c0: torch.Tensor,
-    h1: torch.Tensor,
-    c1: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # player_id: [N] in {0,1}; each h/c: [1,N,H]
-    sel = player_id.view(1, -1, 1).to(dtype=torch.bool)
-    h = torch.where(sel, h1, h0)
-    c_ = torch.where(sel, c1, c0)
-    return h, c_
-
-
-def _scatter_player_state(
-    *,
-    player_id: torch.Tensor,
-    h_new: torch.Tensor,
-    c_new: torch.Tensor,
-    h0: torch.Tensor,
-    c0: torch.Tensor,
-    h1: torch.Tensor,
-    c1: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Update only the acting player's slot for each env.
-    is_p1 = player_id.to(dtype=torch.bool).view(1, -1, 1)
-    h0 = torch.where(is_p1, h0, h_new)
-    c0 = torch.where(is_p1, c0, c_new)
-    h1 = torch.where(is_p1, h_new, h1)
-    c1 = torch.where(is_p1, c_new, c1)
-    return h0, c0, h1, c1
 
 
 def run(cfg: TrainConfig) -> TrainResult:
@@ -1174,7 +981,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
         diag_log_ratio_max_t = torch.full((), float("-inf"), device=device, dtype=torch.float32)
 
         if cfg.timing_sync:
-            _sync(cfg.device)
+            sync(cfg.device)
         t_collect0 = time.perf_counter()
         with torch.no_grad():
             for t in range(cfg.rollout_steps):
@@ -1192,7 +999,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                 pid = obs["player_id"].to(dtype=torch.int64)
                 ep_id = obs["episode_id"].to(dtype=torch.int32)
 
-                h_batch, c_batch = _select_player_state(player_id=pid, h0=h0, c0=c0, h1=h1, c1=c1)
+                h_batch, c_batch = select_player_state(player_id=pid, h0=h0, c0=c0, h1=h1, c1=c1)
 
                 # IMPORTANT: `obs` tensors are zero-copy views into env-owned buffers that
                 # get overwritten in-place by `env.step()`. Snapshot the current observation
@@ -1220,7 +1027,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                         )
 
                     # Update the acting player's hidden state.
-                    h0, c0, h1, c1 = _scatter_player_state(
+                    h0, c0, h1, c1 = scatter_player_state(
                         player_id=pid,
                         h_new=out.h,
                         c_new=out.c,
@@ -1450,9 +1257,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
             # Bootstrap value at the end of rollout from the current acting player.
             if not cfg.league_enabled:
                 pid_last = obs["player_id"].to(dtype=torch.int64)
-                h_last, c_last = _select_player_state(
-                    player_id=pid_last, h0=h0, c0=c0, h1=h1, c1=c1
-                )
+                h_last, c_last = select_player_state(player_id=pid_last, h0=h0, c0=c0, h1=h1, c1=c1)
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
                     out_last = net.forward_step(
                         cards=obs["cards"],
@@ -1475,18 +1280,18 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
         env_steps += env_steps_per_rollout
         pbar.update(env_steps_per_rollout)
         if cfg.timing_sync:
-            _sync(cfg.device)
+            sync(cfg.device)
         t_collect_s = time.perf_counter() - t_collect0
 
         # Determine whether we will log this update BEFORE running PPO.
         do_log = env_steps >= next_log_env_steps
 
         if cfg.timing_sync:
-            _sync(cfg.device)
+            sync(cfg.device)
         t_opt0 = time.perf_counter()
 
         if not cfg.league_enabled:
-            advantages, returns = _compute_gae(
+            advantages, returns = compute_gae(
                 rewards=buf.reward,
                 dones=buf.done,
                 values=buf.value,
@@ -1519,8 +1324,8 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
             else:
                 ev = 1.0 - (returns_f - values_f).var(unbiased=False) / var_v
             ev_rollout = float(ev.detach().item())
-            act_stats = _action_stats(buf.action_type, buf.raise_bucket)
-            street_stats = _action_stats_by_street(
+            act_stats = action_stats(buf.action_type, buf.raise_bucket)
+            street_stats = action_stats_by_street(
                 action_type=buf.action_type,
                 raise_bucket=buf.raise_bucket,
                 scalars=buf.scalars,
@@ -1531,7 +1336,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
             train_mask_f = None
             total_effective = float(total)
         else:
-            returns_p0, valid_p0 = _compute_mc_returns_p0(reward_p0=buf.reward_p0, dones=buf.done)
+            returns_p0, valid_p0 = compute_mc_returns_p0(reward_p0=buf.reward_p0, dones=buf.done)
             returns_act = torch.where(buf.player_id.eq(0), returns_p0, -returns_p0)
             train_mask_f = (valid_p0 & buf.learner_mask).reshape(-1)
             if not bool(train_mask_f.any().item()):
@@ -1569,8 +1374,8 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                 resid_var = ((returns_f - values_f).pow(2) * w_all).sum() / denom_all
                 ev = 1.0 - resid_var / var_v
             ev_rollout = float(ev.detach().item())
-            act_stats = _action_stats_masked(buf.action_type, buf.raise_bucket, buf.learner_mask)
-            street_stats = _action_stats_by_street(
+            act_stats = action_stats_masked(buf.action_type, buf.raise_bucket, buf.learner_mask)
+            street_stats = action_stats_by_street(
                 action_type=buf.action_type,
                 raise_bucket=buf.raise_bucket,
                 scalars=buf.scalars,
@@ -1613,8 +1418,8 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                         terminated=None,
                     )
 
-                _assert_finite("old_logprob", old_logprob_f[sl])
-                _assert_finite("new_logprob", eval_out.logprob)
+                assert_finite("old_logprob", old_logprob_f[sl])
+                assert_finite("new_logprob", eval_out.logprob)
 
                 # Guard against exp overflow (which can otherwise turn PPO into NaNs/inf).
                 log_ratio_raw = eval_out.logprob - old_logprob_f[sl]
@@ -1711,7 +1516,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                 maybe_refresh("update")
 
         if cfg.timing_sync:
-            _sync(cfg.device)
+            sync(cfg.device)
         t_opt_s = time.perf_counter() - t_opt0
 
         do_log = env_steps >= next_log_env_steps
@@ -1902,7 +1707,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
         # Periodic checkpointing by env steps.
         if next_save_env_steps > 0 and env_steps >= next_save_env_steps:
             if cfg.timing_sync:
-                _sync(cfg.device)
+                sync(cfg.device)
             t_misc0 = time.perf_counter()
             ckpt_path = Path(cfg.checkpoint_dir) / f"ckpt_env{env_steps}_upd{update}.pt"
             save_checkpoint(
@@ -1913,12 +1718,12 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
             )
             next_save_env_steps += cfg.save_every_env_steps
             if cfg.timing_sync:
-                _sync(cfg.device)
+                sync(cfg.device)
             t_misc_s += time.perf_counter() - t_misc0
 
         if cfg.eval_every > 0 and (update + 1) % cfg.eval_every == 0:
             if cfg.timing_sync:
-                _sync(cfg.device)
+                sync(cfg.device)
             t_eval0 = time.perf_counter()
             eval_env = get_eval_env()
             all_eval: dict[str, dict[str, float]] = {}
@@ -2037,7 +1842,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                 writer.add_scalar("eval/pool_mix_bb_per_hand_p0", mix["bb_per_hand_p0"], env_steps)
                 writer.add_scalar("eval/pool_mix_bb_per_hand_p1", mix["bb_per_hand_p1"], env_steps)
             if cfg.timing_sync:
-                _sync(cfg.device)
+                sync(cfg.device)
             t_eval_s = time.perf_counter() - t_eval0
 
         # League: snapshot creation (disk-backed + in-memory ring).
@@ -2048,7 +1853,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
             and (update + 1) % int(cfg.league_snapshot_every_updates) == 0
         ):
             if cfg.timing_sync:
-                _sync(cfg.device)
+                sync(cfg.device)
             # Demote previous main agent to historical
             current_main = next((o for o in opponent_metas if o.agent_role == "main"), None)
             if current_main is not None:
@@ -2101,7 +1906,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
             net.eval()
             try:
                 if cfg.timing_sync:
-                    _sync(cfg.device)
+                    sync(cfg.device)
                 t_league0 = time.perf_counter()
                 eval_env = get_eval_env()
 
@@ -2247,7 +2052,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                     )
 
                 if cfg.timing_sync:
-                    _sync(cfg.device)
+                    sync(cfg.device)
                 t_league_eval_s = time.perf_counter() - t_league0
             finally:
                 if was_training:
@@ -2265,7 +2070,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
             was_training = net.training
             try:
                 if cfg.timing_sync:
-                    _sync(cfg.device)
+                    sync(cfg.device)
                 t_sp0 = time.perf_counter()
                 net.eval()
 
@@ -2376,7 +2181,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                         bb_latest = 0.5 * (bb0 + bb1) if seat_swap else bb0
                         writer.add_scalar("selfplay/vs_latest_bb_per_hand", bb_latest, env_steps)
                 if cfg.timing_sync:
-                    _sync(cfg.device)
+                    sync(cfg.device)
                 t_selfplay_eval_s = time.perf_counter() - t_sp0
             finally:
                 if was_training:
@@ -2429,7 +2234,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
 
     pbar.close()
 
-    _sync(cfg.device)
+    sync(cfg.device)
     t1 = time.perf_counter()
 
     elapsed_s = t1 - t0
@@ -2475,7 +2280,7 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
 
     Sibling of ``_run_impl`` (single-net path). Selected by
     ``run(cfg)`` when ``cfg.triad_enabled=True``. Reuses ``_make_policy``,
-    ``_compute_mc_returns_p0``, ``_push_transformer_token``, and the
+    ``compute_mc_returns_p0``, ``_push_transformer_token``, and the
     UnifiedOpponentPool; everything else is per-role via
     ``TriadController``.
 
@@ -2736,7 +2541,7 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
 
                 pid = obs["player_id"].to(dtype=torch.int64)
                 ep_id = obs["episode_id"].to(dtype=torch.int32)
-                h_batch, c_batch = _select_player_state(player_id=pid, h0=h0, c0=c0, h1=h1, c1=c1)
+                h_batch, c_batch = select_player_state(player_id=pid, h0=h0, c0=c0, h1=h1, c1=c1)
 
                 # Snapshot s_t into each role's buffer (sliced views).
                 for role in ROLES:
@@ -2991,7 +2796,7 @@ def _run_impl_triad(cfg: TrainConfig) -> TrainResult:
             rs = triad.role(role)
             # Per-step actor-perspective reward: flip sign when p1 was actor.
             reward_actor = torch.where(rs.buf.player_id.eq(0), rs.buf.reward_p0, -rs.buf.reward_p0)
-            advantages, returns = _compute_gae(
+            advantages, returns = compute_gae(
                 rewards=reward_actor,
                 dones=rs.buf.done.to(dtype=torch.bool),
                 values=rs.buf.value,

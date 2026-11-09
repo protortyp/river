@@ -5,7 +5,7 @@ import torch
 
 
 def test_self_play_gae_flips_bootstrap_for_opponent_perspective():
-    from train.train import _compute_gae
+    from train.ppo_utils import compute_gae
 
     rewards = torch.tensor([[0.0]])
     dones = torch.tensor([[False]])
@@ -14,7 +14,7 @@ def test_self_play_gae_flips_bootstrap_for_opponent_perspective():
     last_value = torch.tensor([10.0])
     last_player_id = torch.tensor([1])
 
-    advantages, returns = _compute_gae(
+    advantages, returns = compute_gae(
         rewards=rewards,
         dones=dones,
         values=values,
@@ -30,7 +30,7 @@ def test_self_play_gae_flips_bootstrap_for_opponent_perspective():
 
 
 def test_self_play_gae_keeps_bootstrap_sign_for_same_player_perspective():
-    from train.train import _compute_gae
+    from train.ppo_utils import compute_gae
 
     rewards = torch.tensor([[0.0]])
     dones = torch.tensor([[False]])
@@ -39,7 +39,7 @@ def test_self_play_gae_keeps_bootstrap_sign_for_same_player_perspective():
     last_value = torch.tensor([10.0])
     last_player_id = torch.tensor([1])
 
-    advantages, returns = _compute_gae(
+    advantages, returns = compute_gae(
         rewards=rewards,
         dones=dones,
         values=values,
