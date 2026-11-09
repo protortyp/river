@@ -80,7 +80,6 @@ class HandGenerator:
     """
 
     def __init__(self):
-        # These tables will be populated.
         self.unsuited_table = np.zeros(MAX_PRIME_PRODUCT, dtype=np.int16)
         self.flush_table = np.zeros(MAX_RANK_BITMASK, dtype=np.int16)
 

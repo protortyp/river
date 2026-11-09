@@ -11,8 +11,8 @@ from gpu_poker import constants as constants
 # Discrete raise-size buckets. Each entry is a *pot fraction*; sentinel values
 # `MIN_RAISE_BUCKET` and `ALL_IN_BUCKET` map to min_raise and max_raise (all-in)
 # respectively. This matches the ReBeL / Slumbot / Libratus action abstraction
-# (Brown et al. 2020, Brown & Sandholm 2018) and is a prerequisite for any
-# future CFR-style search at decision time.
+# (Brown et al. 2020, Brown & Sandholm 2018) and is a prerequisite for
+# CFR-style search at decision time.
 MIN_RAISE_BUCKET = -1.0
 ALL_IN_BUCKET = -2.0
 RAISE_BUCKET_FRACTIONS: tuple[float, ...] = (

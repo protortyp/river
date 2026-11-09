@@ -33,7 +33,6 @@ def shuffle_and_deal(state: GameState, env_idx: wp.int32):
     state.hole_cards[env_idx, c.PLAYER_1, 0] = state.deck[env_idx, 2]
     state.hole_cards[env_idx, c.PLAYER_1, 1] = state.deck[env_idx, 3]
 
-    # Set pointer past dealt cards
     state.deck_top[env_idx] = 4
 
 
@@ -201,7 +200,7 @@ def calculate_rewards(state: GameState, env_idx: wp.int32, winner_idx: wp.int32)
             p0_share = p0_share + 1
 
     # Calculate Reward: What I ended up with MINUS what I started with
-    # Note: state.stacks is currently (Initial - Invested)
+    # state.stacks holds the remaining stack (initial minus invested).
     p0_final = state.stacks[env_idx, 0] + p0_share
     p0_initial = state.initial_stacks[env_idx, 0]
 

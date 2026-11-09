@@ -288,7 +288,6 @@ class WarpPokerEnv:
         seeds = np.random.randint(0, 2**32, size=n, dtype=np.uint32)
         rng_state = wp.array(seeds, dtype=wp.uint32, device=d)
 
-        # Create struct and assign arrays
         game_state = GameState()
         game_state.stage = stage
         game_state.button = button
@@ -333,7 +332,6 @@ class WarpPokerEnv:
         unsuited_np = hand_ranks["unsuited_table"].astype(np.int16)
         flush_np = hand_ranks["flush_table"].astype(np.int16)
 
-        # Get primes from constants (already defined in constants.py)
         primes_np = np.array(c.RANK_PRIMES, dtype=np.int32)
 
         # Convert to Warp arrays (automatically uploads to device)
@@ -366,7 +364,6 @@ class WarpPokerEnv:
             device=self.device,
         )
 
-        # Get initial observations
         wp.launch(
             kernel=get_obs_legal_kernel,
             dim=self.num_envs,
@@ -381,7 +378,6 @@ class WarpPokerEnv:
             device=self.device,
         )
 
-        # Return initial observations
         return {
             "cards": wp.to_torch(self.obs_cards),
             "scalars": wp.to_torch(self.obs_scalars),
@@ -453,11 +449,10 @@ class WarpPokerEnv:
         if amounts_torch is None:
             amounts_torch = torch.zeros_like(actions_torch)
 
-        # Zero-copy convert torch -> warp
+        # Torch -> warp conversion.
         wp.copy(self.actions, wp.from_torch(actions_torch, dtype=wp.int32))
         wp.copy(self.amounts, wp.from_torch(amounts_torch, dtype=wp.int32))
 
-        # Launch Step Kernel
         wp.launch(
             kernel=step_kernel_per_env,
             dim=self.num_envs,
@@ -478,7 +473,6 @@ class WarpPokerEnv:
             device=self.device,
         )
 
-        # Launch Observation Kernel
         wp.launch(
             kernel=get_obs_legal_kernel,
             dim=self.num_envs,
@@ -493,10 +487,8 @@ class WarpPokerEnv:
             device=self.device,
         )
 
-        # Copy done flags from state
         wp.copy(self.dones, self.state.done)
 
-        # Return Torch Views (zero-copy)
         return {
             "cards": wp.to_torch(self.obs_cards),
             "scalars": wp.to_torch(self.obs_scalars),
