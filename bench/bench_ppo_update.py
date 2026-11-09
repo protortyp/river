@@ -21,14 +21,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
+from _common import sync
 
 from gpu_poker import constants as c
 from gpu_poker.policy import NUM_RAISE_BUCKETS, PokerPolicyNet
-
-
-def _sync(device: str) -> None:
-    if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize()
 
 
 @dataclass(frozen=True)
@@ -208,7 +204,7 @@ def run(cfg: BenchConfig) -> dict:
     # Warmup
     for _ in range(int(cfg.warmup)):
         step_one_update()
-    _sync(cfg.device)
+    sync(cfg.device)
 
     if has_cuda:
         torch.cuda.reset_peak_memory_stats(device=device)
@@ -219,7 +215,7 @@ def run(cfg: BenchConfig) -> dict:
         iter_t0 = time.perf_counter()
         step_one_update()
         if cfg.sync_every_iter:
-            _sync(cfg.device)
+            sync(cfg.device)
         iter_dt = time.perf_counter() - iter_t0
         if cfg.record_per_iter:
             row: dict[str, float] = {"iter": float(i), "elapsed_s": float(iter_dt)}
@@ -230,7 +226,7 @@ def run(cfg: BenchConfig) -> dict:
                 row["mem_peak_reserved"] = float(torch.cuda.max_memory_reserved(device=device))
             per_iter.append(row)
     if not cfg.sync_every_iter:
-        _sync(cfg.device)
+        sync(cfg.device)
     dt = time.perf_counter() - t0
 
     samples = int(cfg.iters) * int(cfg.num_epochs) * total

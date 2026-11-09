@@ -22,16 +22,11 @@ from dataclasses import dataclass
 
 import torch
 import warp as wp
+from _common import sync
 
 from gpu_poker import constants as c
 from gpu_poker.env import WarpPokerEnv
 from gpu_poker.policy import PokerPolicyNet, raise_bucket_to_amount
-
-
-def _sync(device: str) -> None:
-    if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize()
-    wp.synchronize()
 
 
 @dataclass
@@ -82,7 +77,7 @@ def run_training_iteration(
     raise_buckets = torch.zeros((rollout_steps, num_envs), dtype=torch.int64, device=device)
 
     obs = env.reset()
-    _sync(device)
+    sync(device)
 
     # === Collection phase ===
     t0 = time.perf_counter()
@@ -129,7 +124,7 @@ def run_training_iteration(
             dones[t] = next_obs["terminated"]
             obs = next_obs
 
-    _sync(device)
+    sync(device)
     collection_ms = (time.perf_counter() - t0) * 1000
 
     # === PPO update phase ===
@@ -184,7 +179,7 @@ def run_training_iteration(
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             opt.step()
 
-    _sync(device)
+    sync(device)
     ppo_ms = (time.perf_counter() - t0) * 1000
 
     return collection_ms, ppo_ms
@@ -346,7 +341,7 @@ def run_training_iteration_with_cuda_graph(
     raise_buckets = torch.zeros((rollout_steps, num_envs), dtype=torch.int64, device=device)
 
     obs = env.reset()
-    _sync(device)
+    sync(device)
 
     # === Collection phase ===
     t0 = time.perf_counter()
@@ -393,7 +388,7 @@ def run_training_iteration_with_cuda_graph(
             dones[t] = next_obs["terminated"]
             obs = next_obs
 
-    _sync(device)
+    sync(device)
     collection_ms = (time.perf_counter() - t0) * 1000
 
     # === PPO update phase with CUDA graph ===
@@ -436,7 +431,7 @@ def run_training_iteration_with_cuda_graph(
                 returns=returns[start:end],
             )
 
-    _sync(device)
+    sync(device)
     ppo_ms = (time.perf_counter() - t0) * 1000
 
     return collection_ms, ppo_ms

@@ -23,15 +23,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
+from _common import sync
+from train.ppo_utils import compute_gae
 
 from gpu_poker import constants as const
 from gpu_poker.env import WarpPokerEnv
 from gpu_poker.policy import PokerPolicyNet, raise_bucket_to_amount
-
-
-def _sync(device: str) -> None:
-    if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize()
 
 
 @dataclass(frozen=True)
@@ -66,29 +63,6 @@ def _select_player_state(
     h = torch.where(mask0, h0, h1)
     c_state = torch.where(mask0, c0, c1)
     return h, c_state
-
-
-def _compute_gae(
-    *,
-    rewards: torch.Tensor,  # [T,N]
-    dones: torch.Tensor,  # [T,N] bool
-    values: torch.Tensor,  # [T,N]
-    last_value: torch.Tensor,  # [N]
-    gamma: float,
-    gae_lambda: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    t_steps, batch = rewards.shape
-    advantages = torch.zeros((t_steps, batch), device=rewards.device, dtype=torch.float32)
-    gae = torch.zeros((batch,), device=rewards.device, dtype=torch.float32)
-    next_value = last_value
-    for t in range(t_steps - 1, -1, -1):
-        not_done = (~dones[t]).to(dtype=torch.float32)
-        delta = rewards[t] + gamma * not_done * next_value - values[t]
-        gae = delta + gamma * gae_lambda * not_done * gae
-        advantages[t] = gae
-        next_value = values[t]
-    returns = advantages + values
-    return advantages, returns
 
 
 class _Rollout:
@@ -169,7 +143,7 @@ def run(cfg: BenchConfig) -> dict:
 
     for it in range(int(cfg.iters)):
         if cfg.timing_sync:
-            _sync(cfg.device)
+            sync(cfg.device)
         t_col0 = time.perf_counter()
 
         for t in range(int(cfg.rollout_steps)):
@@ -244,7 +218,7 @@ def run(cfg: BenchConfig) -> dict:
                 obs = next_obs
 
         if cfg.timing_sync:
-            _sync(cfg.device)
+            sync(cfg.device)
         t_col_s = time.perf_counter() - t_col0
 
         # Bootstrap value
@@ -263,14 +237,16 @@ def run(cfg: BenchConfig) -> dict:
             last_value = out_last.value.to(dtype=torch.float32)
 
         if cfg.timing_sync:
-            _sync(cfg.device)
+            sync(cfg.device)
         t_opt0 = time.perf_counter()
 
-        advantages, returns = _compute_gae(
+        advantages, returns = compute_gae(
             rewards=buf.reward,
             dones=buf.done,
             values=buf.value,
             last_value=last_value,
+            player_id=buf.player_id,
+            last_player_id=pid_last,
             gamma=0.99,
             gae_lambda=0.95,
         )
@@ -314,18 +290,18 @@ def run(cfg: BenchConfig) -> dict:
                 opt.step()
 
         if cfg.timing_sync:
-            _sync(cfg.device)
+            sync(cfg.device)
         t_opt_s = time.perf_counter() - t_opt0
 
         # Trigger a mid-run eval env allocation to reproduce VRAM cliffs.
         if int(cfg.trigger_eval_env_iter) >= 0 and it == int(cfg.trigger_eval_env_iter):
             if cfg.timing_sync:
-                _sync(cfg.device)
+                sync(cfg.device)
             t_alloc0 = time.perf_counter()
             eval_env = WarpPokerEnv(num_envs=cfg.eval_env_num_envs, device=cfg.device)
             _ = eval_env.reset()
             if cfg.timing_sync:
-                _sync(cfg.device)
+                sync(cfg.device)
             t_alloc_s = time.perf_counter() - t_alloc0
         else:
             t_alloc_s = 0.0

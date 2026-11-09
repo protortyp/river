@@ -22,32 +22,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
+from _common import sync
+from train.league import pfsp_weights_from_bb_per_hand
 
 from gpu_poker import constants as c
 from gpu_poker.env import WarpPokerEnv
 from gpu_poker.policy import PokerPolicyNet, raise_bucket_to_amount
-
-
-def pfsp_weights_from_bb_per_hand(
-    bb_per_hand: torch.Tensor, *, temperature: float, epsilon: float
-) -> torch.Tensor:
-    """
-    Local copy of `train.league.pfsp_weights_from_bb_per_hand`.
-
-    Keeping this benchmark self-contained avoids `ModuleNotFoundError: train` when running
-    `uv run bench/bench_league_rollout.py` directly.
-    """
-    t = max(1e-6, float(temperature))
-    p = torch.sigmoid(bb_per_hand / t)
-    w = p * (1.0 - p)
-    if epsilon > 0:
-        w = w + float(epsilon)
-    return w
-
-
-def _sync(device: str) -> None:
-    if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize()
 
 
 @dataclass(frozen=True)
@@ -213,12 +193,12 @@ def run(cfg: BenchConfig) -> dict:
     # Warmup
     for _ in range(int(cfg.warmup)):
         do_rollout()
-    _sync(cfg.device)
+    sync(cfg.device)
 
     t0 = time.perf_counter()
     for _ in range(int(cfg.iters)):
         do_rollout()
-    _sync(cfg.device)
+    sync(cfg.device)
     dt = time.perf_counter() - t0
 
     env_steps = int(cfg.iters) * int(cfg.rollout_steps) * int(cfg.num_envs)

@@ -10,15 +10,10 @@ from pathlib import Path
 
 import torch
 import warp as wp
+from _common import sync
 
 from gpu_poker import constants as c
 from gpu_poker.env import WarpPokerEnv, get_obs_legal_kernel, step_kernel
-
-
-def _sync(device: str) -> None:
-    if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize()
-    wp.synchronize()
 
 
 def _uses_cuda_events(device: str) -> bool:
@@ -127,7 +122,7 @@ def _bench_env_step(
             )
         env.step(action_types, amounts)
 
-    _sync(env.device)
+    sync(env.device)
     use_cuda_events = _uses_cuda_events(env.device)
     if use_cuda_events:
         start_evt = wp.Event(env.device, enable_timing=True)
@@ -145,7 +140,7 @@ def _bench_env_step(
 
     if use_cuda_events:
         wp.record_event(end_evt)
-    _sync(env.device)
+    sync(env.device)
     if use_cuda_events:
         wp.synchronize_event(end_evt)
     t1 = time.perf_counter()
@@ -245,7 +240,7 @@ def _bench_kernels(
         )
 
     def time_block(fn, iters: int) -> float:
-        _sync(d)
+        sync(d)
         use_cuda_events = _uses_cuda_events(d)
         if use_cuda_events:
             start_evt = wp.Event(d, enable_timing=True)
@@ -256,7 +251,7 @@ def _bench_kernels(
             fn()
         if use_cuda_events:
             wp.record_event(end_evt)
-        _sync(d)
+        sync(d)
         if use_cuda_events:
             wp.synchronize_event(end_evt)
             return wp.get_event_elapsed_time(start_evt, end_evt) / 1000.0
@@ -267,7 +262,7 @@ def _bench_kernels(
         fill_actions()
         run_step()
         run_post()
-    _sync(d)
+    sync(d)
 
     # Total pipeline timings (GPU + wall)
     use_cuda_events = _uses_cuda_events(d)
@@ -283,7 +278,7 @@ def _bench_kernels(
         run_post()
     if use_cuda_events:
         wp.record_event(end_evt_total)
-    _sync(d)
+    sync(d)
     if use_cuda_events:
         wp.synchronize_event(end_evt_total)
     t1 = time.perf_counter()
@@ -336,7 +331,7 @@ def main() -> int:
 
     env = WarpPokerEnv(num_envs=num_envs, device=device)
     env.reset()
-    _sync(device)
+    sync(device)
 
     cases = [
         BenchmarkCase(

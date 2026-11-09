@@ -3,15 +3,10 @@ import time
 
 import torch
 import warp as wp
+from _common import sync
 
 from gpu_poker import constants as c
 from gpu_poker.env import WarpPokerEnv
-
-
-def _sync(device: str) -> None:
-    if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize()
-    wp.synchronize()
 
 
 def _make_actions(
@@ -105,7 +100,7 @@ def main() -> int:
             )
         _ = env.step(action_types, amounts)
 
-    _sync(args.device)
+    sync(args.device)
 
     # Timed section.
     t0 = time.perf_counter()
@@ -118,7 +113,7 @@ def main() -> int:
                 starting_stack=args.starting_stack,
             )
         _ = env.step(action_types, amounts)
-    _sync(args.device)
+    sync(args.device)
     t1 = time.perf_counter()
 
     elapsed_s = t1 - t0
