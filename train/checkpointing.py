@@ -46,13 +46,17 @@ def save_checkpoint(
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
+    raw_sd = {
+        k.replace("._orig_mod.", ".").replace("_orig_mod.", ""): v
+        for k, v in model.state_dict().items()
+    }
     payload = {
         "state": {
             "env_steps": int(state.env_steps),
             "opt_steps": int(state.opt_steps),
             "update": int(state.update),
         },
-        "model": model.state_dict(),
+        "model": raw_sd,
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "rng": {
             "torch": torch.get_rng_state(),
@@ -74,7 +78,11 @@ def load_checkpoint(
     # - torch RNG state must be a CPU ByteTensor for `torch.set_rng_state()`
     # - optimizer state can be moved to the target device after loading
     payload = torch.load(Path(path), map_location="cpu")
-    model.load_state_dict(payload["model"])
+    sd = {
+        k.replace("._orig_mod.", ".").replace("_orig_mod.", ""): v
+        for k, v in payload["model"].items()
+    }
+    model.load_state_dict(sd)
     if optimizer is not None and payload.get("optimizer") is not None:
         optimizer.load_state_dict(payload["optimizer"])
         _move_optimizer_state_to_device(optimizer, device)

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from torch.distributions import Categorical
+from torch.nn import functional as fn
 
 from gpu_poker import constants as constants
 from gpu_poker.policy import NUM_RAISE_BUCKETS
@@ -120,6 +121,88 @@ def _sinusoidal_pos_enc(seq_len: int, d_model: int, device: torch.device) -> tor
     return pe
 
 
+class _SDPAEncoderLayer(nn.Module):
+    """Pre-LN Transformer encoder block using native Flash/cuDNN SDPA in PyTorch
+    and explicit matmul-softmax during ONNX opset-17 export.
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        n_heads: int,
+        ffn_dim: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+        self.d_model = int(d_model)
+        self.n_heads = int(n_heads)
+        self.head_dim = self.d_model // self.n_heads
+        self.dropout = float(dropout)
+
+        self.norm1 = nn.LayerNorm(self.d_model)
+        self.in_proj = nn.Linear(self.d_model, 3 * self.d_model)
+        self.out_proj = nn.Linear(self.d_model, self.d_model)
+        self.norm2 = nn.LayerNorm(self.d_model)
+        self.linear1 = nn.Linear(self.d_model, int(ffn_dim))
+        self.linear2 = nn.Linear(int(ffn_dim), self.d_model)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        b, s, d = h.shape
+        qkv = self.in_proj(h).reshape(b, s, 3, self.n_heads, self.head_dim)
+        q = qkv[:, :, 0].transpose(1, 2)
+        k = qkv[:, :, 1].transpose(1, 2)
+        v = qkv[:, :, 2].transpose(1, 2)
+
+        if torch.onnx.is_in_onnx_export():
+            scores = torch.matmul(q, k.transpose(-2, -1)) * (self.head_dim**-0.5)
+            bias = torch.where(
+                key_padding_mask,
+                torch.full_like(key_padding_mask, -1e9, dtype=scores.dtype),
+                torch.zeros_like(key_padding_mask, dtype=scores.dtype),
+            ).view(b, 1, 1, s)
+            weights = torch.softmax(scores + bias, dim=-1)
+            attn_out = torch.matmul(weights, v)
+        else:
+            # PyTorch SDPA bool mask: True = attend, False = masked out.
+            keep_mask = (~key_padding_mask).view(b, 1, 1, s)
+            attn_out = fn.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=keep_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
+
+        attn_out = attn_out.transpose(1, 2).reshape(b, s, d)
+        x = x + self.out_proj(attn_out)
+        x = x + self.linear2(fn.gelu(self.linear1(self.norm2(x))))
+        return x
+
+
+class _SDPAEncoderStack(nn.Module):
+    """Stack of `_SDPAEncoderLayer` blocks kept as a dedicated submodule for `torch.compile`."""
+
+    def __init__(self, *, n_layers: int, d_model: int, n_heads: int, ffn_dim: int, dropout: float):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                _SDPAEncoderLayer(
+                    d_model=d_model, n_heads=n_heads, ffn_dim=ffn_dim, dropout=dropout
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, key_padding_mask)
+        return x
+
+
 class PokerTransformerPolicyNet(nn.Module):
     """Encoder-only Transformer policy with suit-canonical card tokens and CTDE critic."""
 
@@ -167,18 +250,13 @@ class PokerTransformerPolicyNet(nn.Module):
         )
         self.cur_type_emb = nn.Parameter(torch.zeros(self.d_model))
 
-        # ---- Transformer encoder ----
-        layer = nn.TransformerEncoderLayer(
+        # ---- SDPA Transformer encoder ----
+        self.blocks: nn.Module = _SDPAEncoderStack(
+            n_layers=self.n_layers,
             d_model=self.d_model,
-            nhead=self.n_heads,
-            dim_feedforward=self.ffn_dim,
+            n_heads=self.n_heads,
+            ffn_dim=self.ffn_dim,
             dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(
-            layer, num_layers=self.n_layers, enable_nested_tensor=False
         )
 
         # Sequence: [1 scalar query token] + [7 card tokens] + [max_tokens history tokens].
@@ -192,11 +270,66 @@ class PokerTransformerPolicyNet(nn.Module):
         self.value_head = nn.Linear(self.d_model, 1)
         self.raise_head = nn.Linear(self.d_model, NUM_RAISE_BUCKETS)
 
-        # ---- Training-only omniscient critic head (CTDE) ----
+        # ---- Training-only omniscient critic (CTDE) ----
+        # Opponent hole cards cross-attend to [latent, hero cards, board cards] before value MLP
+        # so the critic directly evaluates made hands, draws, and blockers on the current board.
+        self.omni_norm_q = nn.LayerNorm(self.d_model)
+        self.omni_norm_kv = nn.LayerNorm(self.d_model)
+        self.omni_cross_attn = nn.MultiheadAttention(
+            self.d_model, self.n_heads, dropout=dropout, batch_first=True
+        )
         self.omniscient_value_head = nn.Sequential(
             nn.Linear(self.d_model * 3, self.d_model),
             nn.GELU(),
             nn.Linear(self.d_model, 1),
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: dict,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        # Remap legacy nn.TransformerEncoder keys (`encoder.layers.*`) and fill newly added
+        # CTDE cross-attention keys so pre-SDPA checkpoints load cleanly.
+        legacy_prefix = f"{prefix}encoder.layers."
+        remapped = False
+        for k in list(state_dict.keys()):
+            if k.startswith(legacy_prefix):
+                remapped = True
+                rest = k[len(legacy_prefix) :]
+                if ".self_attn.in_proj_weight" in rest:
+                    new_rest = rest.replace(".self_attn.in_proj_weight", ".in_proj.weight")
+                elif ".self_attn.in_proj_bias" in rest:
+                    new_rest = rest.replace(".self_attn.in_proj_bias", ".in_proj.bias")
+                elif ".self_attn.out_proj." in rest:
+                    new_rest = rest.replace(".self_attn.out_proj.", ".out_proj.")
+                else:
+                    new_rest = rest
+                state_dict[f"{prefix}blocks.layers.{new_rest}"] = state_dict.pop(k)
+
+        if remapped:
+            own = self.state_dict()
+            for suffix in (
+                "omni_norm_q.weight",
+                "omni_norm_q.bias",
+                "omni_norm_kv.weight",
+                "omni_norm_kv.bias",
+                "omni_cross_attn.in_proj_weight",
+                "omni_cross_attn.in_proj_bias",
+                "omni_cross_attn.out_proj.weight",
+                "omni_cross_attn.out_proj.bias",
+            ):
+                full_k = f"{prefix}{suffix}"
+                if full_k not in state_dict and suffix in own:
+                    state_dict[full_k] = own[suffix].clone()
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         )
 
     @property
@@ -257,15 +390,15 @@ class PokerTransformerPolicyNet(nn.Module):
         )
         return self.card_embed(card_idx) + self.rank_embed(rank_idx) + self.suit_embed(suit_idx)
 
-    def encode_state(
+    def _encode_with_cards(
         self,
         *,
         cards: torch.Tensor,
         scalars: torch.Tensor,
         tokens: torch.Tensor,
         lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode observation + action history into `[B, D]` latent and `[B, 4]` suit map."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode obs + history -> `(latent [B,D], card_out [B,7,D], card_pad [B,7], canon_map)`."""
         batch_size = cards.shape[0]
         device = cards.device
 
@@ -298,8 +431,22 @@ class PokerTransformerPolicyNet(nn.Module):
         hist_pad = pos >= lengths.to(dtype=torch.int64).unsqueeze(1)
         key_padding_mask = torch.cat([cur_pad, card_pad, hist_pad], dim=1)
 
-        y = self.encoder(x, mask=None, src_key_padding_mask=key_padding_mask)
-        return y[:, 0, :], canon_map
+        y = self.blocks(x, key_padding_mask)
+        return y[:, 0, :], y[:, 1 : 1 + NUM_CARD_SLOTS, :], card_pad, canon_map
+
+    def encode_state(
+        self,
+        *,
+        cards: torch.Tensor,
+        scalars: torch.Tensor,
+        tokens: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode observation + action history into `[B, D]` latent and `[B, 4]` suit map."""
+        latent, _, _, canon_map = self._encode_with_cards(
+            cards=cards, scalars=scalars, tokens=tokens, lengths=lengths
+        )
+        return latent, canon_map
 
     def _masked_action_logits(
         self, logits: torch.Tensor, action_mask: torch.Tensor
@@ -319,6 +466,8 @@ class PokerTransformerPolicyNet(nn.Module):
     def _compute_values(
         self,
         latent: torch.Tensor,
+        card_out: torch.Tensor,
+        card_pad: torch.Tensor,
         canon_map: torch.Tensor,
         opp_cards: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -337,8 +486,21 @@ class PokerTransformerPolicyNet(nn.Module):
             [torch.where(swap, h1, h0), torch.where(swap, h0, h1)],
             dim=1,
         )
-        opp_emb = self._embed_cards(opp_sorted).reshape(latent.shape[0], -1)  # [B, 2*D]
-        omni_in = torch.cat([latent, opp_emb], dim=-1)
+        opp_toks = self._embed_cards(opp_sorted)  # [B, 2, D]
+        kv = torch.cat([latent.unsqueeze(1), card_out], dim=1)  # [B, 8, D]
+        kv_pad = torch.cat(
+            [torch.zeros((latent.shape[0], 1), device=latent.device, dtype=torch.bool), card_pad],
+            dim=1,
+        )
+        attn_ctx, _ = self.omni_cross_attn(
+            self.omni_norm_q(opp_toks),
+            self.omni_norm_kv(kv),
+            self.omni_norm_kv(kv),
+            key_padding_mask=kv_pad,
+            need_weights=False,
+        )
+        opp_feat = (opp_toks + attn_ctx).reshape(latent.shape[0], -1)  # [B, 2*D]
+        omni_in = torch.cat([latent, opp_feat], dim=-1)
         omni_val = self.omniscient_value_head(omni_in).squeeze(-1)
         return omni_val, dec_val
 
@@ -367,7 +529,7 @@ class PokerTransformerPolicyNet(nn.Module):
                 tokens = torch.where(mask, torch.zeros_like(tokens), tokens)
                 lengths = torch.where(reset, torch.zeros_like(lengths), lengths)
 
-        latent, canon_map = self.encode_state(
+        latent, card_out, card_pad, canon_map = self._encode_with_cards(
             cards=cards, scalars=scalars, tokens=tokens, lengths=lengths
         )
 
@@ -377,7 +539,7 @@ class PokerTransformerPolicyNet(nn.Module):
         raise_logits = self.raise_head(latent)
         raise_dist = Categorical(logits=raise_logits.to(dtype=torch.float32))
 
-        value, dec_value = self._compute_values(latent, canon_map, opp_cards)
+        value, dec_value = self._compute_values(latent, card_out, card_pad, canon_map, opp_cards)
         return act_dist, raise_dist, value, dec_value, tokens, lengths
 
     def _coerce_input_state(
