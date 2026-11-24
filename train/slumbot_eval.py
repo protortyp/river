@@ -380,15 +380,36 @@ def parse_action_tokens(action_str: str) -> list[tuple[int, str]]:
     return out
 
 
-def replay_history(state: HUNLState, action_str: str, board_per_street: list[list[int]]) -> None:
+def amount_to_nearest_bucket(delta: int, *, pot_total: int, min_raise: int, max_raise: int) -> int:
+    """Map an arbitrary chip raise delta to the closest discrete raise bucket index."""
+    best_idx = 0
+    best_err = float("inf")
+    for idx, frac in enumerate(RAISE_BUCKET_FRACTIONS):
+        if frac == MIN_RAISE_BUCKET:
+            target = min_raise
+        elif frac == ALL_IN_BUCKET:
+            target = max_raise
+        else:
+            target = round(frac * pot_total)
+        target = max_raise if max_raise < min_raise else max(min_raise, min(max_raise, target))
+        err = abs(int(delta) - int(target))
+        if err < best_err:
+            best_err = err
+            best_idx = idx
+    return best_idx
+
+
+def replay_history(
+    state: HUNLState, action_str: str, board_per_street: list[list[int]]
+) -> list[tuple[int, int, int, int]]:
     """
     Re-apply Slumbot's action history to our HUNL state machine, revealing board
-    cards at each street boundary. `board_per_street` is the cumulative board
-    after each street starts: index 0 = preflop (empty), 1 = flop (3 cards),
-    2 = turn (4), 3 = river (5). We supply only as many as needed.
+    cards at each street boundary, and return the public action token list
+    `[(player_id, action_type, raise_bucket, stage), ...]` for transformer models.
     """
     tokens = parse_action_tokens(action_str)
     current_street = 0
+    history: list[tuple[int, int, int, int]] = []
     for street_idx, tok in tokens:
         # Reveal new board cards if we just crossed a street boundary.
         while current_street < street_idx:
@@ -396,30 +417,38 @@ def replay_history(state: HUNLState, action_str: str, board_per_street: list[lis
             if current_street < len(board_per_street):
                 state.reveal_board(board_per_street[current_street])
 
+        p = state.active_player
+        stage = state.stage
         if tok == "f":
+            history.append((p, const.ACTION_FOLD, 0, stage))
             state.apply(const.ACTION_FOLD)
         elif tok == "k":
+            history.append((p, const.ACTION_CHECK, 0, stage))
             state.apply(const.ACTION_CHECK)
         elif tok == "c":
-            # Slumbot uses 'c' for both check (preflop BB option, postflop) and call.
-            # Distinguish by current to_call.
-            tc = state.to_call(state.active_player)
+            tc = state.to_call(p)
             if tc == 0:
+                history.append((p, const.ACTION_CHECK, 0, stage))
                 state.apply(const.ACTION_CHECK)
             else:
+                history.append((p, const.ACTION_CALL, 0, stage))
                 state.apply(const.ACTION_CALL)
         elif tok.startswith("b") or tok.startswith("r"):
             target_total = int(tok[1:])
-            p = state.active_player
             tc = state.to_call(p)
             current_bet = state.bets[p]
-            # `delta` = chips added above the call.
             delta = max(0, target_total - current_bet - tc)
+            _, min_r, max_r = state.legal_actions()
+            pot_total = state.pot + state.bets[0] + state.bets[1]
+            bkt = amount_to_nearest_bucket(
+                delta, pot_total=pot_total, min_raise=min_r, max_raise=max_r
+            )
+            history.append((p, const.ACTION_RAISE, bkt, stage))
             state.apply(const.ACTION_RAISE, amount=delta)
         else:
             raise ValueError(f"bad token: {tok!r} in {action_str!r}")
 
-    # Final stage advance might have already happened inside apply().
+    return history
 
 
 def format_action_for_slumbot(state: HUNLState, action_type: int, amount: int) -> str:
@@ -441,19 +470,55 @@ def format_action_for_slumbot(state: HUNLState, action_type: int, amount: int) -
 # ---------------------------------------------------------------------------
 
 
+TRANSFORMER_MAX_TOKENS = 32
+TRANSFORMER_STATE_WIDTH = TRANSFORMER_MAX_TOKENS * 4 + 1
+
+
 class OnnxPolicy:
-    def __init__(self, model_path: str, lstm_hidden: int = 384, deterministic: bool = True):
+    def __init__(
+        self,
+        model_path: str,
+        lstm_hidden: int | None = None,
+        deterministic: bool = True,
+    ):
         import onnxruntime as ort
 
         self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-        self.lstm_hidden = lstm_hidden
+        # Auto-detect state width from ONNX input `h` shape [1, B, H] (129 = Transformer).
+        h_width = 384
+        for inp in self.session.get_inputs():
+            if inp.name == "h" and len(inp.shape) == 3 and isinstance(inp.shape[2], int):
+                h_width = int(inp.shape[2])
+                break
+        if lstm_hidden is not None:
+            h_width = int(lstm_hidden)
+
+        self.state_width = h_width
+        self.is_transformer = h_width == TRANSFORMER_STATE_WIDTH
         self.deterministic = deterministic
-        self.h = np.zeros((1, 1, lstm_hidden), dtype=np.float32)
-        self.c = np.zeros((1, 1, lstm_hidden), dtype=np.float32)
+        self.h = np.zeros((1, 1, self.state_width), dtype=np.float32)
+        self.c = np.zeros((1, 1, self.state_width), dtype=np.float32)
 
     def reset_state(self) -> None:
         self.h.fill(0)
         self.c.fill(0)
+
+    def set_transformer_history(self, history: list[tuple[int, int, int, int]]) -> None:
+        """Pack up to 32 public-action tokens `(pid, act, bucket, stage)` into `self.h`."""
+        if not self.is_transformer:
+            return
+        self.h.fill(0)
+        n = min(len(history), TRANSFORMER_MAX_TOKENS)
+        for i in range(n):
+            pid, act, bkt, stg = history[i]
+            base = i * 4
+            self.h[0, 0, base + 0] = float(max(0, min(2, pid + 1)))
+            self.h[0, 0, base + 1] = float(max(0, min(const.NUM_ACTIONS, act + 1)))
+            self.h[0, 0, base + 2] = float(
+                max(0, min(NUM_RAISE_BUCKETS, (bkt if act == const.ACTION_RAISE else 0) + 1))
+            )
+            self.h[0, 0, base + 3] = float(max(0, min(const.NUM_STAGES, stg + 1)))
+        self.h[0, 0, TRANSFORMER_MAX_TOKENS * 4] = float(n)
 
     def act(self, obs: dict[str, np.ndarray]) -> tuple[int, int]:
         feeds = {
@@ -558,7 +623,8 @@ def run(model_path: str, n_hands: int, deterministic: bool = True, verbose: bool
         policy.reset_state()
 
         try:
-            replay_history(state, action_str, _board_per_street(board))
+            hist = replay_history(state, action_str, _board_per_street(board))
+            policy.set_transformer_history(hist)
         except Exception as e:
             print(f"[hand {hand_i}] replay failed on initial state: {e}")
             print(f"  action={action_str!r} board={board} hole={data['hole_cards']}")
@@ -638,7 +704,8 @@ def run(model_path: str, n_hands: int, deterministic: bool = True, verbose: bool
             # called policy.act, so the next hero turn's h/c starts from there).
             state = HUNLState(button=button, hero_seat=hero_seat, hole_cards_hero=hole)
             try:
-                replay_history(state, action_str, _board_per_street(board))
+                hist = replay_history(state, action_str, _board_per_street(board))
+                policy.set_transformer_history(hist)
             except Exception as e:
                 print(f"[hand {hand_i}] mid-hand replay failed: {e}")
                 break
