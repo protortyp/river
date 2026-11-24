@@ -16,8 +16,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from gpu_poker.cfv_net import RiverCFVNet
 
 from gpu_poker import constants as c
 from gpu_poker.policy import (
@@ -353,6 +357,7 @@ class _RiverNode:
     # - Fold: folding player loses their committed chips c_f; opponent wins c_f.
     c0: float = 0.0
     c1: float = 0.0
+    eff_stack_left: float = 0.0  # effective stack remaining at street-close leaf (for Turn CFVNet)
     actions: list[RiverAction] = field(default_factory=list)
     children: list[_RiverNode] = field(default_factory=list)
     regret_sum: np.ndarray | None = None  # [A, H] float32
@@ -372,8 +377,9 @@ def _build_river_tree(
     bet_fractions: tuple[float, ...],
     max_raises: int,
     inv: tuple[int, int],
+    all_in_max_spr: float | None = None,
 ) -> _RiverNode:
-    """Recursively construct the exact river betting tree from the current street state."""
+    """Recursively construct the exact street betting tree from the current state."""
     p = active_player
     opp = 1 - p
     to_call = max(0, bets[opp] - bets[p])
@@ -388,12 +394,9 @@ def _build_river_tree(
         node.actions.append((c.ACTION_FOLD, 0))
         node.children.append(_RiverNode(kind="fold", player=p, c0=base_c0, c1=base_c1))
 
-        # 2. CALL -> closes river betting -> showdown
+        # 2. CALL -> closes street betting -> showdown / next-street leaf
         call_amt = min(to_call, stacks[p])
         new_inv = (inv[0] + call_amt, inv[1]) if p == 0 else (inv[0], inv[1] + call_amt)
-        # Handle uncalled portion if caller was all-in for less.
-        matched = min(new_inv[0], new_inv[1]) if bets[0] != bets[1] else max(new_inv[0], new_inv[1])
-        # Compute exact matched total bet on this street:
         new_b0 = bets[0] + (call_amt if p == 0 else 0)
         new_b1 = bets[1] + (call_amt if p == 1 else 0)
         street_matched = min(new_b0, new_b1)
@@ -401,15 +404,31 @@ def _build_river_tree(
         uncalled1 = new_b1 - street_matched
         sd_c0 = 0.5 * root_pot + (new_inv[0] - uncalled0)
         sd_c1 = 0.5 * root_pot + (new_inv[1] - uncalled1)
-        _ = matched
+        rem_s0 = stacks[0] - (call_amt if p == 0 else 0) + uncalled0
+        rem_s1 = stacks[1] - (call_amt if p == 1 else 0) + uncalled1
         node.actions.append((c.ACTION_CALL, 0))
-        node.children.append(_RiverNode(kind="showdown", player=-1, c0=sd_c0, c1=sd_c1))
+        node.children.append(
+            _RiverNode(
+                kind="showdown",
+                player=-1,
+                c0=sd_c0,
+                c1=sd_c1,
+                eff_stack_left=float(min(rem_s0, rem_s1)),
+            )
+        )
     else:
         # 1. CHECK
         node.actions.append((c.ACTION_CHECK, 0))
         if actions_taken >= 1:
-            # Check-check closes the river -> showdown.
-            node.children.append(_RiverNode(kind="showdown", player=-1, c0=base_c0, c1=base_c1))
+            node.children.append(
+                _RiverNode(
+                    kind="showdown",
+                    player=-1,
+                    c0=base_c0,
+                    c1=base_c1,
+                    eff_stack_left=float(min(stacks[0], stacks[1])),
+                )
+            )
         else:
             node.children.append(
                 _build_river_tree(
@@ -424,6 +443,7 @@ def _build_river_tree(
                     bet_fractions=bet_fractions,
                     max_raises=max_raises,
                     inv=inv,
+                    all_in_max_spr=all_in_max_spr,
                 )
             )
 
@@ -439,8 +459,9 @@ def _build_river_tree(
             d = max_delta if max_delta < min_delta else max(min_delta, min(max_delta, d))
             if d > 0 and d not in candidate_deltas:
                 candidate_deltas.append(d)
-        # Always include all-in if not already present (crucial for river jams).
-        if max_delta not in candidate_deltas:
+        # Include all-in unless suppressed on deep-SPR turn spots (avoids 50x-pot turn shoves).
+        allow_all_in = (all_in_max_spr is None) or (max_delta <= all_in_max_spr * max(1, pot_total))
+        if allow_all_in and max_delta not in candidate_deltas:
             candidate_deltas.append(max_delta)
         candidate_deltas.sort()
 
@@ -465,6 +486,7 @@ def _build_river_tree(
                     bet_fractions=bet_fractions,
                     max_raises=max_raises,
                     inv=new_inv,
+                    all_in_max_spr=all_in_max_spr,
                 )
             )
 
@@ -516,8 +538,130 @@ class RiverSolveResult:
         return self.strategy[:, pos].copy()
 
 
+class _TurnCFVLeafEvaluator:
+    """ReBeL Turn-leaf evaluator averaging `RiverCFVNet` over unblocked river runouts."""
+
+    def __init__(
+        self,
+        *,
+        board4: list[int],
+        combo_idx: np.ndarray,
+        evaluator: RiverHandEvaluator,
+        cfv_net: RiverCFVNet,
+        device: str = "cpu",
+        sample_rivers: int = 12,
+    ) -> None:
+        import torch
+
+        from gpu_poker.cfv_net import river_hand_strength_pct
+
+        self.torch = torch
+        self.device = torch.device(device)
+        self.cfv_net = cfv_net.to(self.device).eval()
+        self.combo_idx = combo_idx
+        b4_set = set(board4)
+        all_rem = [r for r in range(52) if r not in b4_set]
+        # Deterministic evenly-spaced subset of river runouts for fast, low-variance evaluation.
+        step = max(1, len(all_rem) // max(1, sample_rivers))
+        self.river_cards = all_rem[::step][:sample_rivers]
+
+        c0 = COMBO_C0[combo_idx]
+        c1 = COMBO_C1[combo_idx]
+        hole_pairs = np.stack([c0, c1], axis=1)
+
+        pct_list: list[np.ndarray] = []
+        val_list: list[np.ndarray] = []
+        s_list: list[np.ndarray] = []
+        alive_list: list[np.ndarray] = []
+        for rc in self.river_cards:
+            b5 = [*board4, rc]
+            pct, valid = river_hand_strength_pct(b5, evaluator)
+            pct_list.append(pct)
+            val_list.append(valid)
+            alive = (c0 != rc) & (c1 != rc)
+            alive_list.append(alive)
+            # Zero out blocked combos in per-river showdown matrix.
+            ranks = evaluator.eval_river_combos(hole_pairs, b5)
+            s_r = _build_showdown_matrix(c0, c1, ranks)
+            s_r[~alive, :] = 0.0
+            s_r[:, ~alive] = 0.0
+            s_list.append(s_r)
+
+        self.pct_t = torch.from_numpy(np.stack(pct_list, axis=0)).to(self.device)  # [K, 1326]
+        self.valid_t = torch.from_numpy(np.stack(val_list, axis=0)).to(self.device)  # [K, 1326]
+        self.s_mats = s_list  # K matrices of [H, H]
+        self.alive_masks = alive_list  # K bool masks of [H]
+        self.alive_count = np.maximum(
+            1.0, np.sum(np.stack(alive_list, axis=0).astype(np.float32), axis=0)
+        )
+        self.idx_t = torch.from_numpy(combo_idx.astype(np.int64)).to(self.device)
+
+    def eval_leaf(
+        self,
+        *,
+        r0: np.ndarray,
+        r1: np.ndarray,
+        pot_leaf: float,
+        eff_stack_left: float,
+        update_player: int,
+    ) -> np.ndarray:
+        """Return `[H]` counterfactual value vector for `update_player` at a deep Turn leaf."""
+        torch = self.torch
+        k = len(self.river_cards)
+        r0_full = np.zeros((k, NUM_COMBOS), dtype=np.float32)
+        r1_full = np.zeros((k, NUM_COMBOS), dtype=np.float32)
+        ck0_full = np.zeros((k, NUM_COMBOS), dtype=np.float32)
+        ck1_full = np.zeros((k, NUM_COMBOS), dtype=np.float32)
+        opp_mass = np.zeros(k, dtype=np.float32)
+
+        for i in range(k):
+            alive = self.alive_masks[i]
+            rr0 = np.where(alive, r0, 0.0)
+            rr1 = np.where(alive, r1, 0.0)
+            m0 = float(rr0.sum())
+            m1 = float(rr1.sum())
+            opp_m = m1 if update_player == 0 else m0
+            if opp_m <= 1e-12:
+                continue
+            # Even when the acting player's own reach on this river card is 0, counterfactual
+            # values for unblocked combos remain non-zero whenever opponent reach is positive.
+            if m0 > 1e-12:
+                r0_hat = rr0 / m0
+            else:
+                r0_hat = alive.astype(np.float32) / max(1.0, float(alive.sum()))
+            if m1 > 1e-12:
+                r1_hat = rr1 / m1
+            else:
+                r1_hat = alive.astype(np.float32) / max(1.0, float(alive.sum()))
+            r0_full[i, self.combo_idx] = r0_hat
+            r1_full[i, self.combo_idx] = r1_hat
+            ck0_full[i, self.combo_idx] = 0.5 * (self.s_mats[i] @ r1_hat)
+            ck1_full[i, self.combo_idx] = 0.5 * (self.s_mats[i] @ r0_hat)
+            opp_mass[i] = opp_m
+
+        spr_val = float(eff_stack_left) / max(1.0, float(pot_leaf))
+        with torch.no_grad():
+            p0, p1 = self.cfv_net(
+                r0=torch.from_numpy(r0_full).to(self.device),
+                r1=torch.from_numpy(r1_full).to(self.device),
+                check_cfv0=torch.from_numpy(ck0_full).to(self.device),
+                check_cfv1=torch.from_numpy(ck1_full).to(self.device),
+                rank_pct=self.pct_t,
+                valid_mask=self.valid_t,
+                spr=torch.full((k,), spr_val, device=self.device, dtype=torch.float32),
+            )
+            chosen = p0 if update_player == 0 else p1
+            vals_k = chosen[:, self.idx_t].cpu().numpy()  # [K, H]
+
+        # Scale each river card's normalized CFV by pot_leaf * opp_mass[i] and divide by the
+        # expected number of mutually-unblocked river cards `k * (44 / 48)` (44 for all 48 cards).
+        denom = float(k) * (44.0 / 48.0)
+        weighted = vals_k * (opp_mass[:, None] * float(pot_leaf))
+        return (weighted.sum(axis=0) / denom).astype(np.float32)
+
+
 class RiverDCFRSolver:
-    """Exact range-vs-range Discounted CFR solver for HUNL river subgames (CPU NumPy or CUDA)."""
+    """Exact range-vs-range Discounted CFR solver for HUNL river & turn subgames."""
 
     def __init__(
         self,
@@ -526,11 +670,17 @@ class RiverDCFRSolver:
         max_raises: int = 3,
         evaluator: RiverHandEvaluator | None = None,
         device: str = "cpu",
+        cfv_net: RiverCFVNet | None = None,
+        turn_all_in_max_spr: float = 3.0,
+        cfv_sample_rivers: int = 12,
     ) -> None:
         self.bet_fractions = tuple(float(f) for f in bet_fractions)
         self.max_raises = int(max_raises)
         self.evaluator = evaluator or RiverHandEvaluator()
         self.device = str(device)
+        self.cfv_net = cfv_net
+        self.turn_all_in_max_spr = float(turn_all_in_max_spr)
+        self.cfv_sample_rivers = int(cfv_sample_rivers)
 
     def solve(
         self,
@@ -589,8 +739,9 @@ class RiverDCFRSolver:
         else:
             raise ValueError(f"Expected 4 (turn) or 5 (river) board cards, got {len(board_list)}")
 
-        # Folded/committed root pot accounts for pot + already-matched river bets.
+        # Folded/committed root pot accounts for pot + already-matched street bets.
         root_pot = float(pot + bets[0] + bets[1])
+        is_turn = len(board_list) == 4
         root = _build_river_tree(
             root_pot=root_pot,
             stacks=(int(stacks[0]), int(stacks[1])),
@@ -603,9 +754,21 @@ class RiverDCFRSolver:
             bet_fractions=self.bet_fractions,
             max_raises=self.max_raises,
             inv=(0, 0),
+            all_in_max_spr=self.turn_all_in_max_spr if is_turn else None,
         )
 
-        if self.device.startswith("cuda"):
+        leaf_eval: _TurnCFVLeafEvaluator | None = None
+        if is_turn and self.cfv_net is not None:
+            leaf_eval = _TurnCFVLeafEvaluator(
+                board4=board_list,
+                combo_idx=combo_idx,
+                evaluator=self.evaluator,
+                cfv_net=self.cfv_net,
+                device=self.device,
+                sample_rivers=self.cfv_sample_rivers,
+            )
+
+        if self.device.startswith("cuda") and leaf_eval is None:
             return self._solve_torch(
                 root=root,
                 combo_idx=combo_idx,
@@ -637,6 +800,7 @@ class RiverDCFRSolver:
                 c1=c1,
                 pos_disc=pos_disc,
                 strat_w=strat_w,
+                leaf_eval=leaf_eval,
             )
             self._cfr_traverse(
                 root,
@@ -648,6 +812,7 @@ class RiverDCFRSolver:
                 c1=c1,
                 pos_disc=pos_disc,
                 strat_w=strat_w,
+                leaf_eval=leaf_eval,
             )
 
         assert root.strategy_sum is not None
@@ -816,9 +981,18 @@ class RiverDCFRSolver:
         c1: np.ndarray,
         pos_disc: float,
         strat_w: float,
+        leaf_eval: _TurnCFVLeafEvaluator | None = None,
     ) -> np.ndarray:
         """Return counterfactual value vector `[H]` for `update_player`."""
         if node.kind == "showdown":
+            if leaf_eval is not None and node.eff_stack_left > 0.0:
+                return leaf_eval.eval_leaf(
+                    r0=r0,
+                    r1=r1,
+                    pot_leaf=node.c0 + node.c1,
+                    eff_stack_left=node.eff_stack_left,
+                    update_player=update_player,
+                )
             opp_r = r1 if update_player == 0 else r0
             t_chips = node.c0 if update_player == 0 else node.c1
             return (t_chips * (s_mat @ opp_r)).astype(np.float32)
@@ -850,6 +1024,7 @@ class RiverDCFRSolver:
                         c1=c1,
                         pos_disc=pos_disc,
                         strat_w=strat_w,
+                        leaf_eval=leaf_eval,
                     )
                 else:
                     action_vals[a_idx] = self._cfr_traverse(
@@ -862,6 +1037,7 @@ class RiverDCFRSolver:
                         c1=c1,
                         pos_disc=pos_disc,
                         strat_w=strat_w,
+                        leaf_eval=leaf_eval,
                     )
             node_val = (strat * action_vals).sum(axis=0)
             inst_regret = action_vals - node_val[None, :]
@@ -887,6 +1063,7 @@ class RiverDCFRSolver:
                     c1=c1,
                     pos_disc=pos_disc,
                     strat_w=strat_w,
+                    leaf_eval=leaf_eval,
                 )
             else:
                 total_val += self._cfr_traverse(
@@ -899,6 +1076,7 @@ class RiverDCFRSolver:
                     c1=c1,
                     pos_disc=pos_disc,
                     strat_w=strat_w,
+                    leaf_eval=leaf_eval,
                 )
         return total_val
 
