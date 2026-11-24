@@ -513,13 +513,36 @@ def _canonicalize_combos_np(combo_indices: np.ndarray, board: list[int]) -> np.n
     return np.where(valid, csuits * 13 + ranks, -1)
 
 
+def _sample_pruned_logits(logits: np.ndarray, *, min_prob: float = 0.0) -> int:
+    """Sample from masked logits after pruning low-probability exploration noise."""
+    x = np.asarray(logits, dtype=np.float64)
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return 0
+    m = float(np.max(x[finite]))
+    e = np.where(finite, np.exp(np.clip(x - m, -80.0, 0.0)), 0.0)
+    s = float(e.sum())
+    if not np.isfinite(s) or s <= 0.0:
+        return int(np.argmax(np.where(finite, x, -1e30)))
+    p = e / s
+    if min_prob > 0.0:
+        keep = p >= float(min_prob)
+        if np.any(keep):
+            p = np.where(keep, p, 0.0)
+            p = p / float(p.sum())
+        else:
+            return int(np.argmax(p))
+    return int(np.random.choice(len(p), p=p))
+
+
 class OnnxPolicy:
     def __init__(
         self,
         model_path: str,
         lstm_hidden: int | None = None,
-        deterministic: bool = True,
+        deterministic: bool = False,
         intra_threads: int = 0,
+        min_prob: float = 0.05,
     ):
         import onnxruntime as ort
 
@@ -542,6 +565,7 @@ class OnnxPolicy:
         self.state_width = h_width
         self.is_transformer = h_width == TRANSFORMER_STATE_WIDTH
         self.deterministic = deterministic
+        self.min_prob = float(min_prob)
         self.h = np.zeros((1, 1, self.state_width), dtype=np.float32)
         self.c = np.zeros((1, 1, self.state_width), dtype=np.float32)
         # Cache preflop action-likelihood vectors (identical across hands with the same line).
@@ -587,18 +611,8 @@ class OnnxPolicy:
             action_type = int(np.argmax(action_logits))
             raise_bucket = int(np.argmax(raise_logits))
         else:
-            # Stochastic. Need to softmax over finite logits only.
-            def sample(logits):
-                m = np.max(logits)
-                e = np.exp(logits - m)
-                s = e.sum()
-                if not np.isfinite(s) or s <= 0:
-                    return int(np.argmax(logits))
-                p = e / s
-                return int(np.random.choice(len(p), p=p))
-
-            action_type = sample(action_logits)
-            raise_bucket = sample(raise_logits)
+            action_type = _sample_pruned_logits(action_logits, min_prob=self.min_prob)
+            raise_bucket = _sample_pruned_logits(raise_logits, min_prob=self.min_prob)
         return action_type, raise_bucket
 
     def action_likelihoods_for_combos(
@@ -701,7 +715,8 @@ class TorchPolicy:
         *,
         config_path: str | None = None,
         device: str = "cpu",
-        deterministic: bool = True,
+        deterministic: bool = False,
+        min_prob: float = 0.05,
     ) -> None:
         import torch
 
@@ -721,6 +736,7 @@ class TorchPolicy:
         self.is_transformer = isinstance(self.net, PokerTransformerPolicyNet)
         self.state_width = int(getattr(self.net, "lstm_hidden", TRANSFORMER_STATE_WIDTH))
         self.deterministic = deterministic
+        self.min_prob = float(min_prob)
         self.h = torch.zeros((1, 1, self.state_width), device=self.device, dtype=torch.float32)
         self.c = torch.zeros((1, 1, self.state_width), device=self.device, dtype=torch.float32)
         self._preflop_cache: dict[tuple[Any, ...], np.ndarray] = {}
@@ -757,17 +773,46 @@ class TorchPolicy:
             cards = torch.from_numpy(obs["cards"].reshape(1, 7).astype(np.int64)).to(self.device)
             scalars = torch.from_numpy(obs["scalars"].reshape(1, 17)).to(self.device)
             mask = torch.from_numpy(obs["action_mask"].reshape(1, 4)).to(self.device)
-            out = self.net.forward_step(  # type: ignore[operator]
-                cards=cards,
-                scalars=scalars,
-                action_mask=mask,
-                h=self.h,
-                c=self.c,
-                deterministic=self.deterministic,
+            if self.deterministic or self.min_prob <= 0.0:
+                out = self.net.forward_step(  # type: ignore[operator]
+                    cards=cards,
+                    scalars=scalars,
+                    action_mask=mask,
+                    h=self.h,
+                    c=self.c,
+                    deterministic=self.deterministic,
+                )
+                self.h = out.h
+                self.c = out.c
+                return int(out.action_type[0].item()), int(out.raise_bucket[0].item())
+
+            if self.is_transformer:
+                tokens_t, lengths_t = self.net.unpack_state(self.h)  # type: ignore[operator]
+                act_dist, raise_dist, _, _, _, _ = self.net._forward_latent(  # type: ignore[operator]
+                    cards=cards,
+                    scalars=scalars,
+                    action_mask=mask,
+                    tokens=tokens_t,
+                    lengths=lengths_t,
+                    terminated=None,
+                )
+            else:
+                act_dist, raise_dist, _, h_new, c_new = self.net._forward_latent(  # type: ignore[operator]
+                    cards=cards,
+                    scalars=scalars,
+                    action_mask=mask,
+                    h=self.h,
+                    c=self.c,
+                    terminated=None,
+                )
+                self.h = h_new
+                self.c = c_new
+            a_logits = act_dist.logits[0].detach().cpu().numpy()
+            r_logits = raise_dist.logits[0].detach().cpu().numpy()
+            return (
+                _sample_pruned_logits(a_logits, min_prob=self.min_prob),
+                _sample_pruned_logits(r_logits, min_prob=self.min_prob),
             )
-            self.h = out.h
-            self.c = out.c
-            return int(out.action_type[0].item()), int(out.raise_bucket[0].item())
 
     def action_likelihoods_for_combos(
         self,
@@ -1032,7 +1077,7 @@ def _street_actions_from_str(
 def run(
     model_path: str | None = None,
     n_hands: int = 1000,
-    deterministic: bool = True,
+    deterministic: bool = False,
     verbose: bool = False,
     river_search: bool = False,
     turn_search: bool = False,
@@ -1046,6 +1091,7 @@ def run(
     workers: int = 1,
     log_every: int = 25,
     cfv_net_path: str | None = None,
+    blueprint_min_prob: float = 0.05,
 ) -> None:
     policy: OnnxPolicy | TorchPolicy
     if checkpoint_path is not None:
@@ -1054,9 +1100,15 @@ def run(
             config_path=config_path,
             device=device,
             deterministic=deterministic,
+            min_prob=blueprint_min_prob,
         )
     elif model_path is not None:
-        policy = OnnxPolicy(model_path, deterministic=deterministic, intra_threads=intra_threads)
+        policy = OnnxPolicy(
+            model_path,
+            deterministic=deterministic,
+            intra_threads=intra_threads,
+            min_prob=blueprint_min_prob,
+        )
     else:
         raise ValueError("Provide either --model (ONNX) or --checkpoint (PyTorch)")
     cfv_net = None
@@ -1087,6 +1139,7 @@ def run(
     river_solves = 0
     river_reuses = 0
     deltas: list[int] = []
+    street_deltas: dict[int, list[int]] = {0: [], 1: [], 2: [], 3: []}
 
     def _play_worker(worker_hands: int, worker_id: int) -> None:
         nonlocal chip_total, hands_played, errored_hands
@@ -1387,10 +1440,12 @@ def run(
                 continue
 
             delta = data.get("winnings", state.reward_hero) if data else state.reward_hero
+            end_street = min(3, len(action_str.split("/")) - 1) if action_str else 0
             with stats_lock:
                 chip_total += int(delta)
                 hands_played += 1
                 deltas.append(int(delta))
+                street_deltas[end_street].append(int(delta))
                 done_n = hands_played
                 if verbose or done_n % max(1, int(log_every)) == 0:
                     elapsed = time.perf_counter() - t0
@@ -1434,6 +1489,15 @@ def run(
     ci_hi = bb_per_100 + 1.96 * se
     print(f"bb/100:          {bb_per_100:+.3f} ± {se:.3f}  (95% CI: {ci_lo:+.2f} .. {ci_hi:+.2f})")
     print(f"mbb/g:           {mbb_g:+.1f} ± {se * 10.0:.1f}")
+    street_names = ("preflop", "flop", "turn", "river")
+    parts = []
+    for s_idx, s_name in enumerate(street_names):
+        sd = street_deltas[s_idx]
+        if sd:
+            s_bb100 = (sum(sd) / max(1, hands_played) / SLUMBOT_BB) * 100.0
+            parts.append(f"{s_name}: {len(sd)} ({s_bb100:+.1f} bb/100)")
+    if parts:
+        print("by end street:   " + " | ".join(parts))
     if errored_hands:
         print(f"errored hands skipped: {errored_hands}")
     if turn_search:
@@ -1459,7 +1523,22 @@ def main() -> int:
     )
     p.add_argument("--device", type=str, default="cpu", help="Device for --checkpoint (cpu/cuda).")
     p.add_argument("--hands", type=int, default=1000)
-    p.add_argument("--stochastic", action="store_true", help="Sample instead of argmax.")
+    p.add_argument(
+        "--stochastic",
+        action="store_true",
+        help="Sample mixed strategies (now the default; kept for CLI compatibility).",
+    )
+    p.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Force greedy argmax instead of mixed Nash sampling.",
+    )
+    p.add_argument(
+        "--blueprint-min-prob",
+        type=float,
+        default=0.05,
+        help="Prune blueprint action/bucket probs below this floor before sampling (0 disables).",
+    )
     p.add_argument(
         "--river-search",
         action="store_true",
@@ -1507,7 +1586,7 @@ def main() -> int:
     run(
         model_path=args.model,
         n_hands=int(args.hands),
-        deterministic=not args.stochastic,
+        deterministic=bool(args.deterministic),
         verbose=args.verbose,
         river_search=bool(args.river_search),
         turn_search=bool(args.turn_search),
@@ -1521,6 +1600,7 @@ def main() -> int:
         workers=int(args.workers),
         log_every=int(args.log_every),
         cfv_net_path=args.cfv_net,
+        blueprint_min_prob=float(args.blueprint_min_prob),
     )
     return 0
 
