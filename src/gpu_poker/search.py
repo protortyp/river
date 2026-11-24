@@ -274,6 +274,67 @@ def _build_showdown_matrix(
     return np.where(disjoint, r_cmp, np.float32(0.0))
 
 
+def build_turn_equity_matrix(
+    c0: np.ndarray,
+    c1: np.ndarray,
+    board4: list[int] | np.ndarray,
+    evaluator: RiverHandEvaluator,
+    device: str = "cpu",
+) -> np.ndarray:
+    """Compute exact `[H, H]` turn expected showdown sign matrix averaged over all 44 river cards.
+
+    For every disjoint combo pair `(i, j)` on a 4-card turn board, there are `52 - 4 - 4 = 44`
+    unblocked river cards. Entry `[i, j]` equals `P(i beats j) - P(j beats i)` with exact
+    card-removal blockers and split pots, and is `0.0` whenever combos share a card.
+    """
+    b4 = [int(x) for x in board4]
+    if len(b4) != 4:
+        raise ValueError(f"Expected 4 turn board cards, got {len(b4)}")
+    b4_set = set(b4)
+    h = len(c0)
+    hole_pairs = np.stack([c0, c1], axis=1)
+    disjoint = (
+        (c0[:, None] != c0[None, :])
+        & (c0[:, None] != c1[None, :])
+        & (c1[:, None] != c0[None, :])
+        & (c1[:, None] != c1[None, :])
+    )
+
+    if device.startswith("cuda"):
+        import torch
+
+        dev = torch.device(device)
+        s_sum_t = torch.zeros((h, h), device=dev, dtype=torch.int16)
+        for r_card in range(52):
+            if r_card in b4_set:
+                continue
+            alive = np.nonzero((c0 != r_card) & (c1 != r_card))[0]
+            if len(alive) < 2:
+                continue
+            ranks_r = evaluator.eval_river_combos(hole_pairs[alive], [*b4, r_card])
+            rk_t = torch.from_numpy(ranks_r).to(dev)
+            cmp_t = torch.sign(rk_t[:, None] - rk_t[None, :]).to(dtype=torch.int16)
+            idx_t = torch.from_numpy(alive.astype(np.int64)).to(dev)
+            s_sum_t[idx_t[:, None], idx_t[None, :]] += cmp_t
+        disj_t = torch.from_numpy(disjoint).to(dev)
+        s_bar_t = torch.where(
+            disj_t, s_sum_t.to(dtype=torch.float32) * (1.0 / 44.0), torch.zeros((), device=dev)
+        )
+        return s_bar_t.cpu().numpy()
+
+    s_sum = np.zeros((h, h), dtype=np.int8)
+    for r_card in range(52):
+        if r_card in b4_set:
+            continue
+        alive = np.nonzero((c0 != r_card) & (c1 != r_card))[0]
+        if len(alive) < 2:
+            continue
+        ranks_r = evaluator.eval_river_combos(hole_pairs[alive], [*b4, r_card])
+        cmp_r = np.sign(ranks_r[:, None] - ranks_r[None, :]).astype(np.int8)
+        s_sum[np.ix_(alive, alive)] += cmp_r
+    return np.where(disjoint, s_sum.astype(np.float32) * np.float32(1.0 / 44.0), np.float32(0.0))
+
+
 # ---------------------------------------------------------------------------
 # River betting subgame tree & Discounted CFR solver
 # ---------------------------------------------------------------------------
@@ -518,9 +579,15 @@ class RiverDCFRSolver:
         h_count = len(combo_idx)
         c0 = COMBO_C0[combo_idx]
         c1 = COMBO_C1[combo_idx]
-        hole_pairs = np.stack([c0, c1], axis=1)
-        ranks = self.evaluator.eval_river_combos(hole_pairs, board)
-        s_mat = _build_showdown_matrix(c0, c1, ranks)
+        board_list = [int(x) for x in board]
+        if len(board_list) == 5:
+            hole_pairs = np.stack([c0, c1], axis=1)
+            ranks = self.evaluator.eval_river_combos(hole_pairs, board_list)
+            s_mat = _build_showdown_matrix(c0, c1, ranks)
+        elif len(board_list) == 4:
+            s_mat = build_turn_equity_matrix(c0, c1, board_list, self.evaluator, device=self.device)
+        else:
+            raise ValueError(f"Expected 4 (turn) or 5 (river) board cards, got {len(board_list)}")
 
         # Folded/committed root pot accounts for pot + already-matched river bets.
         root_pot = float(pot + bets[0] + bets[1])
@@ -1087,3 +1154,42 @@ class RiverSubgameSession:
         ch = node.children[chosen_idx]
         self.current_node = ch if ch.kind == "decision" else None
         return act_type, amount
+
+    def handoff_to_river(
+        self,
+        *,
+        river_card: int,
+        river_solver: RiverDCFRSolver,
+        iterations: int | None = None,
+        prune_eps: float | None = None,
+        keep_combo: int | None = None,
+    ) -> RiverSubgameSession:
+        """Continual re-solving handoff from a solved 4-card turn session into the 5-card river.
+
+        Masks `river_card` from both Turn-solved ranges and returns a fresh `RiverSubgameSession`
+        without re-running blueprint belief tracking on earlier streets.
+        """
+        if len(self.board) != 4:
+            raise ValueError(
+                f"handoff_to_river requires a 4-card turn board, got {len(self.board)}"
+            )
+        rc = int(river_card)
+        blocked = (rc == COMBO_C0) | (rc == COMBO_C1)
+        next_ranges: list[np.ndarray] = []
+        for p in (0, 1):
+            r = self.ranges[p].copy()
+            r[blocked] = 0.0
+            s = float(r.sum())
+            if s > 1e-12:
+                r /= s
+            next_ranges.append(r)
+        return RiverSubgameSession(
+            solver=river_solver,
+            board=[*self.board, rc],
+            range_p0=next_ranges[0],
+            range_p1=next_ranges[1],
+            big_blind=self.big_blind,
+            iterations=self.iterations if iterations is None else int(iterations),
+            prune_eps=self.prune_eps if prune_eps is None else float(prune_eps),
+            keep_combo=self.keep_combo if keep_combo is None else keep_combo,
+        )

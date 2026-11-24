@@ -1003,10 +1003,10 @@ def _board_per_street(board_strs: list[str]) -> list[list[int]]:
 # ---------------------------------------------------------------------------
 
 
-def _river_actions_from_str(
-    button: int, action_str: str, board_per_street: list[list[int]]
+def _street_actions_from_str(
+    button: int, action_str: str, board_per_street: list[list[int]], target_stage: int
 ) -> list[tuple[int, int, int]]:
-    """Return `[(player_id, action_type, chip_delta), ...]` for river-street tokens only."""
+    """Return `[(player_id, action_type, chip_delta), ...]` for one street (turn/river)."""
     st = HUNLState(button=button, hero_seat=0, hole_cards_hero=[0, 1])
     tokens = parse_action_tokens(action_str)
     cur_street = 0
@@ -1030,7 +1030,7 @@ def _river_actions_from_str(
             act = const.ACTION_RAISE
         else:
             continue
-        if st.stage == const.STAGE_RIVER:
+        if st.stage == target_stage:
             out.append((p, act, delta))
         st.apply(act, amount=delta)
     return out
@@ -1042,6 +1042,7 @@ def run(
     deterministic: bool = True,
     verbose: bool = False,
     river_search: bool = False,
+    turn_search: bool = False,
     search_iters: int = 150,
     search_max_raises: int = 2,
     search_device: str = "cpu",
@@ -1069,7 +1070,7 @@ def run(
             max_raises=search_max_raises,
             device=search_device,
         )
-        if river_search
+        if (river_search or turn_search)
         else None
     )
 
@@ -1080,12 +1081,15 @@ def run(
     chip_total = 0
     hands_played = 0
     errored_hands = 0
+    turn_solves = 0
+    turn_reuses = 0
     river_solves = 0
     river_reuses = 0
     deltas: list[int] = []
 
     def _play_worker(worker_hands: int, worker_id: int) -> None:
-        nonlocal chip_total, hands_played, errored_hands, river_solves, river_reuses
+        nonlocal chip_total, hands_played, errored_hands
+        nonlocal turn_solves, turn_reuses, river_solves, river_reuses
         s = requests.Session()
         token = ""
 
@@ -1117,6 +1121,8 @@ def run(
                 hole_cards_hero=hole,
             )
             hand_errored = False
+            turn_session: RiverSubgameSession | None = None
+            turn_tokens_seen = 0
             river_session: RiverSubgameSession | None = None
             river_tokens_seen = 0
 
@@ -1146,13 +1152,20 @@ def run(
                 obs = encode_obs(state)
                 used_search = False
                 amount = 0
-                if solver is not None and state.stage == const.STAGE_RIVER and len(board) == 5:
+                if (
+                    turn_search
+                    and solver is not None
+                    and state.stage == const.STAGE_TURN
+                    and len(board) == 4
+                ):
                     try:
                         bps = _board_per_street(board)
                         hero_cid = combo_id(hole[0], hole[1])
-                        riv_acts = _river_actions_from_str(button, action_str, bps)
+                        turn_acts = _street_actions_from_str(
+                            button, action_str, bps, const.STAGE_TURN
+                        )
                         with infer_lock:
-                            if river_session is None:
+                            if turn_session is None:
                                 bt = compute_river_beliefs(
                                     policy=policy,
                                     button=button,
@@ -1160,9 +1173,9 @@ def run(
                                     board_per_street=bps,
                                     keep_combo=hero_cid,
                                 )
-                                river_session = RiverSubgameSession(
+                                turn_session = RiverSubgameSession(
                                     solver=solver,
-                                    board=bps[3],
+                                    board=bps[2],
                                     range_p0=bt.ranges[0],
                                     range_p1=bt.ranges[1],
                                     big_blind=state.bb_chips,
@@ -1170,7 +1183,82 @@ def run(
                                     prune_eps=1e-4,
                                     keep_combo=hero_cid,
                                 )
-                                river_tokens_seen = len(riv_acts)
+                                turn_tokens_seen = len(turn_acts)
+                            else:
+                                for _pid, v_act, v_delta in turn_acts[turn_tokens_seen:]:
+                                    turn_session.observe_action(v_act, v_delta)
+                                turn_tokens_seen = len(turn_acts)
+
+                            prev_solves = turn_session.solves_run
+                            action_type, amount = turn_session.act(
+                                pot=state.pot,
+                                stacks=(state.stacks[0], state.stacks[1]),
+                                bets=(state.bets[0], state.bets[1]),
+                                active_player=state.active_player,
+                                actions_taken=state.actions_this_street,
+                                raises_taken=state.num_raises,
+                                last_raise=state.last_raise,
+                                hole_cards=hole,
+                                deterministic=deterministic,
+                            )
+                            new_solve = turn_session.solves_run > prev_solves
+                        turn_tokens_seen += 1
+                        used_search = True
+                        with stats_lock:
+                            if new_solve:
+                                turn_solves += 1
+                            else:
+                                turn_reuses += 1
+                    except Exception as e:
+                        print(f"[hand {hand_tag}] turn_search fallback: {e}")
+
+                elif (
+                    river_search
+                    and solver is not None
+                    and state.stage == const.STAGE_RIVER
+                    and len(board) == 5
+                ):
+                    try:
+                        bps = _board_per_street(board)
+                        hero_cid = combo_id(hole[0], hole[1])
+                        riv_acts = _street_actions_from_str(
+                            button, action_str, bps, const.STAGE_RIVER
+                        )
+                        with infer_lock:
+                            if river_session is None:
+                                if turn_session is not None and len(riv_acts) == 0:
+                                    # Continual re-solving handoff: observe closing turn actions
+                                    # and transfer Turn-solved ranges directly to the river.
+                                    turn_acts = _street_actions_from_str(
+                                        button, action_str, bps, const.STAGE_TURN
+                                    )
+                                    for _pid, v_act, v_delta in turn_acts[turn_tokens_seen:]:
+                                        turn_session.observe_action(v_act, v_delta)
+                                    river_session = turn_session.handoff_to_river(
+                                        river_card=bps[3][4],
+                                        river_solver=solver,
+                                        keep_combo=hero_cid,
+                                    )
+                                    river_tokens_seen = 0
+                                else:
+                                    bt = compute_river_beliefs(
+                                        policy=policy,
+                                        button=button,
+                                        action_str=action_str,
+                                        board_per_street=bps,
+                                        keep_combo=hero_cid,
+                                    )
+                                    river_session = RiverSubgameSession(
+                                        solver=solver,
+                                        board=bps[3],
+                                        range_p0=bt.ranges[0],
+                                        range_p1=bt.ranges[1],
+                                        big_blind=state.bb_chips,
+                                        iterations=search_iters,
+                                        prune_eps=1e-4,
+                                        keep_combo=hero_cid,
+                                    )
+                                    river_tokens_seen = len(riv_acts)
                             else:
                                 for _pid, v_act, v_delta in riv_acts[river_tokens_seen:]:
                                     river_session.observe_action(v_act, v_delta)
@@ -1321,6 +1409,8 @@ def run(
     print(f"mbb/g:           {mbb_g:+.1f} ± {se * 10.0:.1f}")
     if errored_hands:
         print(f"errored hands skipped: {errored_hands}")
+    if turn_search:
+        print(f"turn DCFR solves:  {turn_solves} (cached tree reuses: {turn_reuses})")
     if river_search:
         print(f"river DCFR solves: {river_solves} (cached tree reuses: {river_reuses})")
 
@@ -1348,8 +1438,13 @@ def main() -> int:
         action="store_true",
         help="Solve river spots online with Bayesian beliefs + nested DCFR subgame solving.",
     )
-    p.add_argument("--search-iters", type=int, default=150, help="DCFR iterations per river solve.")
-    p.add_argument("--search-max-raises", type=int, default=2, help="Max raises in river subgame.")
+    p.add_argument(
+        "--turn-search",
+        action="store_true",
+        help="Solve turn spots with exact 44-river-card DCFR + continual handoff to river.",
+    )
+    p.add_argument("--search-iters", type=int, default=150, help="DCFR iterations per solve.")
+    p.add_argument("--search-max-raises", type=int, default=2, help="Max raises in subgame tree.")
     p.add_argument(
         "--search-device",
         type=str,
@@ -1376,6 +1471,7 @@ def main() -> int:
         deterministic=not args.stochastic,
         verbose=args.verbose,
         river_search=bool(args.river_search),
+        turn_search=bool(args.turn_search),
         search_iters=int(args.search_iters),
         search_max_raises=int(args.search_max_raises),
         search_device=str(args.search_device),
