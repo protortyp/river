@@ -26,6 +26,7 @@ class RolloutBuffer:
         self.dtype = dtype
 
         self.cards = torch.empty((t, n, 7), device=device, dtype=torch.int32)
+        self.opp_cards = torch.empty((t, n, 2), device=device, dtype=torch.int32)
         self.scalars = torch.empty((t, n, scalar_dim), device=device, dtype=dtype)
         self.action_mask = torch.empty((t, n, c.NUM_ACTIONS), device=device, dtype=torch.bool)
         self.player_id = torch.empty((t, n), device=device, dtype=torch.int64)
