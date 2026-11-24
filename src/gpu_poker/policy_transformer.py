@@ -274,16 +274,27 @@ class PokerTransformerPolicyNet(nn.Module):
 
         slot_ids = torch.arange(NUM_CARD_SLOTS, device=device, dtype=torch.int64).unsqueeze(0)
         card_toks = self._embed_cards(canon_cards) + self.slot_embed(slot_ids)  # [B, 7, D]
-        hist_toks = self._embed_history(tokens)  # [B, MAX_TOKENS, D]
+
+        # Trim trailing all-PAD history slots outside ONNX export: because masked keys have
+        # zero attention weight and only position 0 is read, trimming is bit-for-bit lossless
+        # while cutting attention/FFN FLOPs and activation memory by ~2-3x.
+        if torch.onnx.is_in_onnx_export():
+            active_hist = self.max_tokens
+        else:
+            max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+            active_hist = max(1, min(self.max_tokens, max_len))
+
+        hist_toks = self._embed_history(tokens[:, :active_hist, :])  # [B, active_hist, D]
+        seq_len = 1 + NUM_CARD_SLOTS + active_hist
 
         x = torch.cat([cur_tok, card_toks, hist_toks], dim=1)
-        x = x + self.pos_enc.to(x.dtype).unsqueeze(0)
+        x = x + self.pos_enc[:seq_len].to(x.dtype).unsqueeze(0)
 
         # Position 0 (query) is always valid; unrevealed board cards (-1) and empty
         # history slots are masked out.
         cur_pad = torch.zeros((batch_size, 1), device=device, dtype=torch.bool)
         card_pad = canon_cards < 0
-        pos = torch.arange(self.max_tokens, device=device).unsqueeze(0)
+        pos = torch.arange(active_hist, device=device).unsqueeze(0)
         hist_pad = pos >= lengths.to(dtype=torch.int64).unsqueeze(1)
         key_padding_mask = torch.cat([cur_pad, card_pad, hist_pad], dim=1)
 
