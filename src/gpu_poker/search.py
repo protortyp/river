@@ -20,6 +20,72 @@ from pathlib import Path
 import numpy as np
 
 from gpu_poker import constants as c
+from gpu_poker.policy import (
+    ALL_IN_BUCKET,
+    MIN_RAISE_BUCKET,
+    RAISE_BUCKET_FRACTIONS,
+)
+
+
+def pseudo_harmonic_bucket_weights(
+    delta: int,
+    *,
+    pot_total: int,
+    min_raise: int,
+    max_raise: int,
+    fractions: tuple[float, ...] = RAISE_BUCKET_FRACTIONS,
+) -> list[tuple[int, float]]:
+    """Ganzfried & Sandholm (2013) pseudo-harmonic action translation.
+
+    Maps an arbitrary off-tree raise `delta` to a convex combination of at most
+    two adjacent discrete raise buckets `(idx_lo, w_lo), (idx_hi, w_hi)` using
+    `P(A) = ((B - x) * (1 + A)) / ((B - A) * (1 + x))` in pot-fraction space.
+    """
+    pot_f = max(1.0, float(pot_total))
+    targets: list[tuple[int, int]] = []
+    for idx, frac in enumerate(fractions):
+        if frac == MIN_RAISE_BUCKET:
+            t = min_raise
+        elif frac == ALL_IN_BUCKET:
+            t = max_raise
+        else:
+            t = round(frac * pot_f)
+        t = max_raise if max_raise < min_raise else max(min_raise, min(max_raise, int(t)))
+        targets.append((t, idx))
+
+    # Deduplicate identical chip targets (keeping lowest bucket index) and sort ascending.
+    seen: dict[int, int] = {}
+    for t, idx in targets:
+        if t not in seen:
+            seen[t] = idx
+    ordered = sorted(seen.items(), key=lambda kv: kv[0])
+    if not ordered:
+        return [(0, 1.0)]
+
+    d = int(delta)
+    if d <= ordered[0][0]:
+        return [(ordered[0][1], 1.0)]
+    if d >= ordered[-1][0]:
+        return [(ordered[-1][1], 1.0)]
+
+    for i in range(len(ordered) - 1):
+        t_lo, idx_lo = ordered[i]
+        t_hi, idx_hi = ordered[i + 1]
+        if d == t_lo:
+            return [(idx_lo, 1.0)]
+        if d == t_hi:
+            return [(idx_hi, 1.0)]
+        if t_lo < d < t_hi:
+            a = float(t_lo) / pot_f
+            b = float(t_hi) / pot_f
+            x = float(d) / pot_f
+            denom = (b - a) * (1.0 + x)
+            p_lo = ((b - x) * (1.0 + a)) / denom if denom > 1e-12 else 0.5
+            p_lo = max(0.0, min(1.0, p_lo))
+            return [(idx_lo, p_lo), (idx_hi, 1.0 - p_lo)]
+
+    return [(ordered[-1][1], 1.0)]
+
 
 # Canonical 1,326 unordered 2-card combinations (c0 < c1, c in 0..51).
 _COMBO_C0_LIST: list[int] = []
@@ -378,6 +444,7 @@ class RiverSolveResult:
     combo_indices: np.ndarray
     exploitability_chips: float
     root_pot: float
+    root_node: _RiverNode | None = None
 
     def action_probs_for_hand(self, hole_cards: tuple[int, int] | list[int]) -> np.ndarray:
         """Return mixed strategy `[A]` over `self.actions` for Hero's specific 2 cards."""
@@ -389,7 +456,7 @@ class RiverSolveResult:
 
 
 class RiverDCFRSolver:
-    """Exact range-vs-range Discounted CFR solver for HUNL river subgames."""
+    """Exact range-vs-range Discounted CFR solver for HUNL river subgames (CPU NumPy or CUDA)."""
 
     def __init__(
         self,
@@ -397,10 +464,12 @@ class RiverDCFRSolver:
         bet_fractions: tuple[float, ...] = (0.33, 0.75, 1.5),
         max_raises: int = 3,
         evaluator: RiverHandEvaluator | None = None,
+        device: str = "cpu",
     ) -> None:
         self.bet_fractions = tuple(float(f) for f in bet_fractions)
         self.max_raises = int(max_raises)
         self.evaluator = evaluator or RiverHandEvaluator()
+        self.device = str(device)
 
     def solve(
         self,
@@ -421,20 +490,7 @@ class RiverDCFRSolver:
         prune_eps: float = 0.0,
         keep_combo: int | None = None,
     ) -> RiverSolveResult:
-        """Solve the river subgame from the current state and return root strategy.
-
-        Args:
-            board: 5 integer card indices in `0..51`.
-            pot: chips in pot from prior streets (excluding `bets`).
-            stacks: `(stack_p0, stack_p1)` remaining chips.
-            bets: `(bet_p0, bet_p1)` current river-street bets already posted.
-            active_player: `0` or `1`.
-            range_p0, range_p1: `[1326]` (or `[H]`) non-negative reach weights.
-            iterations: number of alternating DCFR iterations (100-300 is tight).
-            prune_eps: drop combos where both players have reach <= prune_eps
-                (0.0 drops exact-zero combos only, which is mathematically lossless).
-            keep_combo: optional combo id in `[0, 1326)` always retained even if pruned.
-        """
+        """Solve the river subgame from the current state and return root strategy."""
         combo_idx = unblocked_combo_indices(board)
         r0 = np.asarray(range_p0, dtype=np.float32)
         r1 = np.asarray(range_p1, dtype=np.float32)
@@ -481,6 +537,21 @@ class RiverDCFRSolver:
             max_raises=self.max_raises,
             inv=(0, 0),
         )
+
+        if self.device.startswith("cuda"):
+            return self._solve_torch(
+                root=root,
+                combo_idx=combo_idx,
+                r0=r0,
+                r1=r1,
+                s_mat=s_mat,
+                c0=c0,
+                c1=c1,
+                root_pot=root_pot,
+                iterations=iterations,
+                compute_exploitability=compute_exploitability,
+            )
+
         _init_node_arrays(root, h_count)
 
         # Alternating Discounted CFR (alpha=1.5, beta=0, gamma=2.0).
@@ -525,6 +596,145 @@ class RiverDCFRSolver:
             combo_indices=combo_idx,
             exploitability_chips=expl,
             root_pot=root_pot,
+            root_node=root,
+        )
+
+    def _solve_torch(
+        self,
+        *,
+        root: _RiverNode,
+        combo_idx: np.ndarray,
+        r0: np.ndarray,
+        r1: np.ndarray,
+        s_mat: np.ndarray,
+        c0: np.ndarray,
+        c1: np.ndarray,
+        root_pot: float,
+        iterations: int,
+        compute_exploitability: bool,
+    ) -> RiverSolveResult:
+        """GPU-accelerated PyTorch DCFR traversal (exact arithmetic match to CPU NumPy)."""
+        import torch
+
+        dev = torch.device(self.device)
+        h_count = len(combo_idx)
+        r0_t = torch.from_numpy(r0).to(dev)
+        r1_t = torch.from_numpy(r1).to(dev)
+        s_t = torch.from_numpy(s_mat).to(dev)
+        c0_t = torch.from_numpy(c0.astype(np.int64)).to(dev)
+        c1_t = torch.from_numpy(c1.astype(np.int64)).to(dev)
+        zeros52 = torch.zeros(52, device=dev, dtype=torch.float32)
+
+        reg_map: dict[int, torch.Tensor] = {}
+        str_map: dict[int, torch.Tensor] = {}
+
+        def init_t(n: _RiverNode) -> None:
+            if n.kind != "decision":
+                return
+            num_a = len(n.actions)
+            nid = id(n)
+            reg_map[nid] = torch.zeros((num_a, h_count), device=dev, dtype=torch.float32)
+            str_map[nid] = torch.zeros((num_a, h_count), device=dev, dtype=torch.float32)
+            for ch in n.children:
+                init_t(ch)
+
+        init_t(root)
+
+        def disjoint_t(opp_r: torch.Tensor) -> torch.Tensor:
+            card_sum = zeros52.clone()
+            card_sum.index_add_(0, c0_t, opp_r)
+            card_sum.index_add_(0, c1_t, opp_r)
+            return opp_r.sum() - card_sum[c0_t] - card_sum[c1_t] + opp_r
+
+        def rm_t(reg: torch.Tensor) -> torch.Tensor:
+            pos = reg.clamp_min(0.0)
+            denom = pos.sum(dim=0, keepdim=True)
+            unif = torch.full_like(pos, 1.0 / float(reg.shape[0]))
+            return torch.where(denom > 1e-12, pos / denom.clamp_min(1e-12), unif)
+
+        def traverse_t(
+            n: _RiverNode,
+            rr0: torch.Tensor,
+            rr1: torch.Tensor,
+            update_player: int,
+            pos_disc: float,
+            strat_w: float,
+        ) -> torch.Tensor:
+            if n.kind == "showdown":
+                opp_r = rr1 if update_player == 0 else rr0
+                t_chips = n.c0 if update_player == 0 else n.c1
+                return t_chips * torch.mv(s_t, opp_r)
+            if n.kind == "fold":
+                opp_r = rr1 if update_player == 0 else rr0
+                dm = disjoint_t(opp_r)
+                if n.player == update_player:
+                    loss = n.c0 if update_player == 0 else n.c1
+                    return -loss * dm
+                gain = n.c1 if update_player == 0 else n.c0
+                return gain * dm
+
+            nid = id(n)
+            strat = rm_t(reg_map[nid])
+            if n.player == update_player:
+                vals = []
+                for a_idx, ch in enumerate(n.children):
+                    if update_player == 0:
+                        vals.append(traverse_t(ch, rr0 * strat[a_idx], rr1, 0, pos_disc, strat_w))
+                    else:
+                        vals.append(traverse_t(ch, rr0, rr1 * strat[a_idx], 1, pos_disc, strat_w))
+                action_vals = torch.stack(vals, dim=0)
+                node_val = (strat * action_vals).sum(dim=0)
+                reg_map[nid] = reg_map[nid].clamp_min(0.0) * pos_disc + (
+                    action_vals - node_val.unsqueeze(0)
+                )
+                own_r = rr0 if update_player == 0 else rr1
+                str_map[nid] = str_map[nid] * strat_w + strat * own_r.unsqueeze(0)
+                return node_val
+
+            total_val = torch.zeros(h_count, device=dev, dtype=torch.float32)
+            for a_idx, ch in enumerate(n.children):
+                if n.player == 0:
+                    total_val = total_val + traverse_t(
+                        ch, rr0 * strat[a_idx], rr1, update_player, pos_disc, strat_w
+                    )
+                else:
+                    total_val = total_val + traverse_t(
+                        ch, rr0, rr1 * strat[a_idx], update_player, pos_disc, strat_w
+                    )
+            return total_val
+
+        with torch.no_grad():
+            for t in range(1, int(iterations) + 1):
+                t_f = float(t)
+                pos_disc = (t_f**1.5) / (t_f**1.5 + 1.0)
+                strat_w = (t_f / (t_f + 1.0)) ** 2.0
+                traverse_t(root, r0_t, r1_t, 0, pos_disc, strat_w)
+                traverse_t(root, r0_t, r1_t, 1, pos_disc, strat_w)
+
+            # Copy strategy_sum back to CPU tree nodes so nested subgame stepping works uniformly.
+            def sync_back(n: _RiverNode) -> None:
+                if n.kind != "decision":
+                    return
+                n.strategy_sum = str_map[id(n)].cpu().numpy()
+                for ch in n.children:
+                    sync_back(ch)
+
+            sync_back(root)
+
+        assert root.strategy_sum is not None
+        root_strat = _average_strategy(root.strategy_sum)
+        expl = (
+            self._compute_exploitability(root, r0, r1, s_mat, c0, c1)
+            if compute_exploitability
+            else 0.0
+        )
+        return RiverSolveResult(
+            actions=root.actions,
+            strategy=root_strat,
+            combo_indices=combo_idx,
+            exploitability_chips=expl,
+            root_pot=root_pot,
+            root_node=root,
         )
 
     def _cfr_traverse(
@@ -731,3 +941,149 @@ class BeliefTracker:
         s = float(self.ranges[p].sum())
         if s > 1e-12:
             self.ranges[p] /= s
+
+
+class RiverSubgameSession:
+    """Stateful nested river subgame solver across all actions within a single river street.
+
+    Solves the full river tree once on river entry, reuses the exact solved child node when
+    the opponent takes an in-tree action (check or matching bet size), and performs Libratus-style
+    continual re-solving with updated solved ranges whenever the opponent makes an off-tree bet.
+    """
+
+    def __init__(
+        self,
+        *,
+        solver: RiverDCFRSolver,
+        board: list[int],
+        range_p0: np.ndarray,
+        range_p1: np.ndarray,
+        big_blind: int = 100,
+        iterations: int = 150,
+        prune_eps: float = 1e-4,
+        keep_combo: int | None = None,
+    ) -> None:
+        self.solver = solver
+        self.board = [int(x) for x in board]
+        self.ranges = [
+            np.asarray(range_p0, dtype=np.float32).copy(),
+            np.asarray(range_p1, dtype=np.float32).copy(),
+        ]
+        self.big_blind = int(big_blind)
+        self.iterations = int(iterations)
+        self.prune_eps = float(prune_eps)
+        self.keep_combo = keep_combo
+        self.current_node: _RiverNode | None = None
+        self.combo_indices: np.ndarray | None = None
+        self.solves_run: int = 0
+
+    def _update_range_from_node(self, node: _RiverNode, action_idx: int) -> None:
+        if node.strategy_sum is None or self.combo_indices is None:
+            return
+        strat = _average_strategy(node.strategy_sum)
+        lik = strat[action_idx] + 1e-4
+        p = int(node.player)
+        self.ranges[p][self.combo_indices] *= lik
+        s = float(self.ranges[p].sum())
+        if s > 1e-12:
+            self.ranges[p] /= s
+
+    def observe_action(self, action_type: int, delta: int = 0) -> None:
+        """Advance the cached river tree by one observed action (hero or opponent).
+
+        If an opponent's raise does not closely match any solved branch, we still update
+        their range using the closest solved raise branch and invalidate `current_node`
+        so the next decision re-solves cleanly at the exact chip state.
+        """
+        node = self.current_node
+        if node is None or node.kind != "decision":
+            self.current_node = None
+            return
+
+        if action_type != c.ACTION_RAISE:
+            for idx, (at, _amt) in enumerate(node.actions):
+                if at == action_type:
+                    self._update_range_from_node(node, idx)
+                    ch = node.children[idx]
+                    self.current_node = ch if ch.kind == "decision" else None
+                    return
+            self.current_node = None
+            return
+
+        # Raise: find closest solved raise branch.
+        raise_indices = [
+            (idx, amt) for idx, (at, amt) in enumerate(node.actions) if at == c.ACTION_RAISE
+        ]
+        if not raise_indices:
+            self.current_node = None
+            return
+        best_idx, best_amt = min(raise_indices, key=lambda pair: abs(pair[1] - int(delta)))
+        self._update_range_from_node(node, best_idx)
+        tol = max(self.big_blind // 2, int(0.08 * max(1, best_amt)))
+        if abs(best_amt - int(delta)) <= tol:
+            ch = node.children[best_idx]
+            self.current_node = ch if ch.kind == "decision" else None
+        else:
+            # Off-tree villain raise: force a nested re-solve at the exact chip state next turn.
+            self.current_node = None
+
+    def act(
+        self,
+        *,
+        pot: int,
+        stacks: tuple[int, int],
+        bets: tuple[int, int],
+        active_player: int,
+        actions_taken: int,
+        raises_taken: int,
+        last_raise: int,
+        hole_cards: list[int],
+        deterministic: bool = False,
+    ) -> tuple[int, int]:
+        """Return `(action_type, chip_delta)` from the cached solved node or a fresh solve."""
+        node = self.current_node
+        if (
+            node is None
+            or node.kind != "decision"
+            or node.player != int(active_player)
+            or node.strategy_sum is None
+            or self.combo_indices is None
+        ):
+            res = self.solver.solve(
+                board=self.board,
+                pot=pot,
+                stacks=stacks,
+                bets=bets,
+                active_player=active_player,
+                range_p0=self.ranges[0],
+                range_p1=self.ranges[1],
+                actions_taken=actions_taken,
+                raises_taken=raises_taken,
+                last_raise=last_raise,
+                big_blind=self.big_blind,
+                iterations=self.iterations,
+                prune_eps=self.prune_eps,
+                keep_combo=self.keep_combo,
+            )
+            self.solves_run += 1
+            self.current_node = res.root_node
+            self.combo_indices = res.combo_indices
+            node = self.current_node
+
+        assert node is not None and node.strategy_sum is not None and self.combo_indices is not None
+        strat = _average_strategy(node.strategy_sum)
+        cid = combo_id(hole_cards[0], hole_cards[1])
+        pos = int(np.searchsorted(self.combo_indices, cid))
+        if pos >= len(self.combo_indices) or int(self.combo_indices[pos]) != cid:
+            raise ValueError(f"Hero hand {hole_cards} missing from solved river combo set")
+        probs = strat[:, pos].copy()
+        probs = probs / max(1e-12, float(probs.sum()))
+        chosen_idx = (
+            int(np.argmax(probs)) if deterministic else int(np.random.choice(len(probs), p=probs))
+        )
+        act_type, amount = node.actions[chosen_idx]
+        # Advance tree past hero's own solved action (updating hero range under solved strat).
+        self._update_range_from_node(node, chosen_idx)
+        ch = node.children[chosen_idx]
+        self.current_node = ch if ch.kind == "decision" else None
+        return act_type, amount

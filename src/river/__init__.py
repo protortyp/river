@@ -11,7 +11,13 @@ from gpu_poker.policy import (
     raise_bucket_to_amount,
 )
 from gpu_poker.policy_transformer import PokerTransformerPolicyNet
-from gpu_poker.search import BeliefTracker, RiverDCFRSolver, RiverHandEvaluator
+from gpu_poker.search import (
+    BeliefTracker,
+    RiverDCFRSolver,
+    RiverHandEvaluator,
+    RiverSubgameSession,
+    pseudo_harmonic_bucket_weights,
+)
 
 __all__ = [
     "ALL_IN_BUCKET",
@@ -23,7 +29,9 @@ __all__ = [
     "RAISE_BUCKET_FRACTIONS",
     "RiverDCFRSolver",
     "RiverHandEvaluator",
+    "RiverSubgameSession",
     "WarpPokerEnv",
     "constants",
+    "pseudo_harmonic_bucket_weights",
     "raise_bucket_to_amount",
 ]
