@@ -243,7 +243,7 @@ def _default_arch_cfg(backbone: str = "lstm") -> dict:
 
 def _load_arch_cfg(checkpoint_path: Path, override: Path | None) -> dict:
     if override is not None:
-        return OmegaConf.to_container(OmegaConf.load(override), resolve=True)  # type: ignore[return-value]
+        return OmegaConf.to_container(OmegaConf.load(override), resolve=False)  # type: ignore[return-value]
     # Hydra dumps the resolved config to `<run_dir>/.hydra/config.yaml`.
     # Checkpoints typically live at `<run_dir>/<checkpoint_dir>/ckpt_xxx.pt`
     # (e.g. `<run_dir>/global_league/checkpoints/ckpt_xxx.pt`).
