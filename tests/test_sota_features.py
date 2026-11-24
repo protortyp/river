@@ -229,3 +229,30 @@ def test_exploitability_cpu_smoke():
     )
     assert res["hands"] >= 128
     assert np.isfinite(res["exploitability_bb_per_100"])
+
+
+def test_dynamic_history_trim_matches_full_sequence():
+    """Trimming trailing PAD history slots must match full-32-token evaluation."""
+    torch.manual_seed(9)
+    net = PokerTransformerPolicyNet(
+        scalar_dim=17, d_model=32, n_heads=4, n_layers=2, ffn_dim=64
+    ).eval()
+    cards = torch.randint(-1, 52, (4, 7), dtype=torch.int32)
+    scalars = torch.randn((4, 17))
+    tokens, lengths = PokerTransformerPolicyNet.init_raw_state(4, torch.device("cpu"))
+    tokens[:, 0] = torch.tensor([1, 4, 3, 1], dtype=torch.int32)
+    tokens[:, 1] = torch.tensor([2, 3, 1, 1], dtype=torch.int32)
+    lengths.fill_(2)
+
+    with torch.no_grad():
+        lat_trimmed, _ = net.encode_state(
+            cards=cards, scalars=scalars, tokens=tokens, lengths=lengths
+        )
+        tokens_full = torch.cat([tokens, tokens[:1]], dim=0)
+        lengths_full = torch.cat([lengths, torch.tensor([32], dtype=torch.int32)], dim=0)
+        cards_full = torch.cat([cards, cards[:1]], dim=0)
+        scalars_full = torch.cat([scalars, scalars[:1]], dim=0)
+        lat_full, _ = net.encode_state(
+            cards=cards_full, scalars=scalars_full, tokens=tokens_full, lengths=lengths_full
+        )
+    assert torch.allclose(lat_trimmed, lat_full[:4], atol=1e-5)

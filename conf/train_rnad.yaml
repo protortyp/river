@@ -4,7 +4,7 @@
 
 device: cuda:0
 num_envs: 65536
-rollout_steps: 64
+rollout_steps: 32
 # Slumbot-matching stakes (50/100) with randomized [40, 200] BB stack depths.
 starting_stack: 20000
 starting_stack_min: 4000
@@ -37,10 +37,10 @@ lstm_hidden: 256
 head_layers: 0
 head_dim: null
 
-num_epochs: 4
-minibatch_size: 65536
+num_epochs: 2
+minibatch_size: 16384
 seed: 42
-log_every_env_steps: 4194304
+log_every_env_steps: 2097152
 log_every_seconds: 1.0
 
 checkpoint_dir: checkpoints/rnad
