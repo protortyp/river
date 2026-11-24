@@ -1,28 +1,38 @@
-# Connection details (SSH target + remote path) come from the gitignored
-# .env -- see .env.example for the keys.
 set dotenv-load := true
 
-# List available recipes (runs when `just` is invoked with no arguments).
 default:
     @just --list
 
-# Lint + type-check: `ruff check` then `ty check`.
+# Lint and type-check
 check:
     uv run ruff check .
+    uv run ruff format --check .
     uv run ty check
 
-# Auto-format the codebase in place.
+# Auto-format Python code
 fmt:
     uv run ruff format .
 
-# Run the test suite.
+# Run Python test suite
 test:
     uv run pytest
 
-# Run the GPU environment benchmark.
+# Run web encoder, engine, and ONNX parity tests
+test-web:
+    cd web && npm test
+
+# Run GPU environment throughput benchmark
 bench:
     uv run python bench/run.py
 
-# Deploy the web UI to production.
-deploy:
-    ssh -i ~/.ssh/id_ed25519 -o IdentityAgent=none "$DEPLOY_SSH_TARGET" "cd $DEPLOY_SERVER_PATH && git pull && ./deploy_pokergpu.sh"
+# Train with default Hydra config (override with args, e.g. `just train triad_enabled=true`)
+train *args:
+    uv run python train/train.py {{args}}
+
+# Export a checkpoint to ONNX for browser or Slumbot inference
+export-onnx ckpt out="web/static/model.onnx":
+    uv run python train/export_onnx.py --checkpoint {{ckpt}} --out {{out}}
+
+# Evaluate an ONNX model against Slumbot
+eval-slumbot model hands="1000":
+    uv run python train/slumbot_eval.py --model {{model}} --hands {{hands}}

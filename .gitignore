@@ -22,8 +22,7 @@ venv/
 env/
 ENV/
 
-# Secrets (MLflow token, vast.ai key, deploy target, etc.). Never commit .env.
-# .env.example is the committed template -- explicitly kept.
+# Secrets (MLflow token, Vast.ai key, etc.). Never commit .env.
 .env
 .env.local
 !.env.example
@@ -33,15 +32,18 @@ ENV/
 *.ptx
 *.cubin
 
-# PyTorch/ML artifacts
+# PyTorch / ONNX / training artifacts
 *.pt
 *.pth
+*.onnx
 checkpoints/
+global_league/
+global_league_triad/
 
 # Lookup tables (npy files regenerated as needed, npz is tracked)
 src/gpu_poker/lookup_data/*.npy
 
-# IDE/Editor
+# IDE / OS
 .vscode/
 .idea/
 *.swp
@@ -59,7 +61,7 @@ bench/latest_league_rollout.json
 bench/latest_ppo_update.json
 bench/latest_train_update.json
 
-# Train smoke outputs
+# Train outputs
 train/runs/
 train/latest.json
 train/latest_policy_train.json
@@ -67,11 +69,16 @@ train/latest_train.json
 train/tensorboard/
 train/outputs/
 
-# Project-specific
+# Web build & generated test fixtures
+web/node_modules/
+web/build/
+web/.svelte-kit/
+web/tests/fixtures.json
+web/tests/fixtures.onnx
+
+# Local scratch & maintainer-only files
 plan.md
 .claude
 gemini.md
-
-# Maintainer-only: internal research journal + private infra notes
 wiki/
 .PRIVATE_AGENTS.md

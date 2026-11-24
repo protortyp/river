@@ -1,5 +1,5 @@
 {
-  "name": "pokergpu-web",
+  "name": "river-web",
   "version": "0.1.0",
   "type": "module",
   "private": true,
@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "smoke": "node smoke.mjs",
-    "pretest": "cd .. && uv run python train/dump_obs_fixtures.py --out web/tests/fixtures.json",
+    "pretest": "cd .. && uv run python train/dump_obs_fixtures.py --out web/tests/fixtures.json && uv run python train/export_onnx.py --init-random --backbone transformer --out web/tests/fixtures.onnx --no-validate",
     "test": "node tests/encoder.test.mjs && node tests/engine.test.mjs && node --test tests/inference_pushtoken.test.mjs tests/inference_onnx_load.test.mjs"
   },
   "dependencies": {

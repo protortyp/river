@@ -209,11 +209,9 @@ triad_entropy_me: null
 triad_entropy_le: null
 
 # =================== MLflow tracking ========================================
-# When true (default), training pushes params/metrics/artifacts to the
-# configured MLflow tracking server (see .env). All MLflow calls are wrapped in
-# _safe_mlflow so failures (server down, network blip) only emit a warning
-# and never crash training. Set false to skip MLflow entirely.
-mlflow_enabled: true
+# Opt-in remote experiment tracking (configure MLFLOW_TRACKING_URI in .env and
+# pass mlflow_enabled=true). All calls degrade to no-ops on network failure.
+mlflow_enabled: false
 # Override the experiment name (defaults to mlflow_config.DEFAULT_EXPERIMENT).
 mlflow_experiment: null
 # Override the run name (auto-generated when null).
