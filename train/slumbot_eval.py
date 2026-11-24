@@ -49,6 +49,7 @@ from gpu_poker.search import (  # noqa: E402
     COMBO_C1,
     BeliefTracker,
     RiverDCFRSolver,
+    combo_id,
     unblocked_combo_indices,
 )
 
@@ -481,16 +482,50 @@ TRANSFORMER_MAX_TOKENS = 32
 TRANSFORMER_STATE_WIDTH = TRANSFORMER_MAX_TOKENS * 4 + 1
 
 
+def _canonicalize_combos_np(combo_indices: np.ndarray, board: list[int]) -> np.ndarray:
+    """Suit-isomorphic canonical `[N, 7]` cards matching `policy_transformer.canonicalize_cards`."""
+    n = len(combo_indices)
+    cards = np.full((n, 7), -1, dtype=np.int32)
+    h0 = COMBO_C0[combo_indices]
+    h1 = COMBO_C1[combo_indices]
+    r0 = h0 % 13
+    r1 = h1 % 13
+    swap = (r1 > r0) | ((r1 == r0) & (h1 > h0))
+    cards[:, 0] = np.where(swap, h1, h0)
+    cards[:, 1] = np.where(swap, h0, h1)
+    for i, bc in enumerate(board[:5]):
+        cards[:, 2 + i] = int(bc)
+
+    valid = cards >= 0
+    ranks = np.where(valid, cards % 13, 0)
+    suits = np.where(valid, cards // 13, -1)
+    pos = np.arange(7, dtype=np.int32)[None, :, None]
+    sids = np.arange(4, dtype=np.int32)[None, None, :]
+    matches = valid[:, :, None] & (suits[:, :, None] == sids)
+    sentinel = np.broadcast_to(7 + sids, (n, 7, 4))
+    first_pos = np.where(matches, pos, sentinel).min(axis=1)
+    cmap = (first_pos[:, :, None] > first_pos[:, None, :]).sum(axis=2)
+    csuits = np.take_along_axis(cmap, np.clip(suits, 0, 3), axis=1)
+    return np.where(valid, csuits * 13 + ranks, -1)
+
+
 class OnnxPolicy:
     def __init__(
         self,
         model_path: str,
         lstm_hidden: int | None = None,
         deterministic: bool = True,
+        intra_threads: int = 0,
     ):
         import onnxruntime as ort
 
-        self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        sess_opts = ort.SessionOptions()
+        if intra_threads > 0:
+            sess_opts.intra_op_num_threads = int(intra_threads)
+            sess_opts.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(
+            model_path, sess_options=sess_opts, providers=["CPUExecutionProvider"]
+        )
         # Auto-detect state width from ONNX input `h` shape [1, B, H] (129 = Transformer).
         h_width = 384
         for inp in self.session.get_inputs():
@@ -505,6 +540,8 @@ class OnnxPolicy:
         self.deterministic = deterministic
         self.h = np.zeros((1, 1, self.state_width), dtype=np.float32)
         self.c = np.zeros((1, 1, self.state_width), dtype=np.float32)
+        # Cache preflop action-likelihood vectors (identical across hands with the same line).
+        self._preflop_cache: dict[tuple[Any, ...], np.ndarray] = {}
 
     def reset_state(self) -> None:
         self.h.fill(0)
@@ -571,16 +608,40 @@ class OnnxPolicy:
         taken_action: int,
         taken_bucket: int,
     ) -> np.ndarray:
-        """Compute `P(taken_action, taken_bucket | combo)` for all combos in one ONNX batch."""
-        n = len(combo_indices)
-        cards = np.full((n, 7), -1, dtype=np.int64)
-        cards[:, 0] = COMBO_C0[combo_indices]
-        cards[:, 1] = COMBO_C1[combo_indices]
-        for i, bc in enumerate(board[:5]):
-            cards[:, 2 + i] = int(bc)
+        """Compute `P(taken_action, taken_bucket | combo)` for all combos via canonical dedup."""
+        is_preflop_full = (
+            self.is_transformer and len(board) == 0 and len(combo_indices) == len(COMBO_C0)
+        )
+        cache_key: tuple[Any, ...] | None = None
+        if is_preflop_full:
+            cache_key = (
+                tuple(np.round(scalars_1d, 5).tolist()),
+                tuple(bool(x) for x in action_mask_1d.tolist()),
+                tuple(history),
+                int(taken_action),
+                int(taken_bucket),
+            )
+            cached = self._preflop_cache.get(cache_key)
+            if cached is not None:
+                return cached
 
-        scalars = np.broadcast_to(scalars_1d.reshape(1, 17), (n, 17)).copy()
-        mask = np.broadcast_to(action_mask_1d.reshape(1, 4), (n, 4)).copy()
+        if self.is_transformer:
+            # Deduplicate suit-isomorphic combos (1326 -> 169 preflop, 1176 -> 344-721 suited).
+            canon_cards = _canonicalize_combos_np(combo_indices, board)
+            uniq_cards, inv = np.unique(canon_cards, axis=0, return_inverse=True)
+            cards = uniq_cards.astype(np.int64)
+            n_eval = cards.shape[0]
+        else:
+            n_eval = len(combo_indices)
+            cards = np.full((n_eval, 7), -1, dtype=np.int64)
+            cards[:, 0] = COMBO_C0[combo_indices]
+            cards[:, 1] = COMBO_C1[combo_indices]
+            for i, bc in enumerate(board[:5]):
+                cards[:, 2 + i] = int(bc)
+            inv = None
+
+        scalars = np.broadcast_to(scalars_1d.reshape(1, 17), (n_eval, 17)).copy()
+        mask = np.broadcast_to(action_mask_1d.reshape(1, 4), (n_eval, 4)).copy()
 
         h_one = np.zeros((1, 1, self.state_width), dtype=np.float32)
         if self.is_transformer:
@@ -595,8 +656,8 @@ class OnnxPolicy:
                 )
                 h_one[0, 0, base + 3] = float(max(0, min(const.NUM_STAGES, stg + 1)))
             h_one[0, 0, TRANSFORMER_MAX_TOKENS * 4] = float(m)
-        h = np.broadcast_to(h_one, (1, n, self.state_width)).copy()
-        c_ = np.zeros((1, n, self.state_width), dtype=np.float32)
+        h = np.broadcast_to(h_one, (1, n_eval, self.state_width)).copy()
+        c_ = np.zeros((1, n_eval, self.state_width), dtype=np.float32)
 
         out = self.session.run(
             None,
@@ -615,17 +676,190 @@ class OnnxPolicy:
             rb_exp = np.exp(rb_shift)
             rb_probs = rb_exp / np.maximum(rb_exp.sum(axis=1, keepdims=True), 1e-12)
             p_act = p_act * rb_probs[:, int(taken_bucket)]
-        return p_act.astype(np.float32)
+
+        res = p_act[inv].astype(np.float32) if inv is not None else p_act.astype(np.float32)
+        if cache_key is not None and len(self._preflop_cache) < 512:
+            self._preflop_cache[cache_key] = res
+        return res
+
+
+class TorchPolicy:
+    """Direct PyTorch checkpoint backend with lossless dynamic PAD history trimming."""
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        *,
+        config_path: str | None = None,
+        device: str = "cpu",
+        deterministic: bool = True,
+    ) -> None:
+        import torch
+
+        from gpu_poker.policy_transformer import PokerTransformerPolicyNet
+        from train.export_onnx import _build_model_from_cfg, _load_arch_cfg
+
+        self.torch = torch
+        self.device = torch.device(device)
+        ckpt_p = Path(checkpoint_path)
+        cfg_p = Path(config_path) if config_path else None
+        arch_cfg = _load_arch_cfg(ckpt_p, cfg_p)
+        net = _build_model_from_cfg(arch_cfg)
+        payload = torch.load(ckpt_p, map_location="cpu", weights_only=False)
+        sd = {k.replace("_orig_mod.", ""): v for k, v in payload["model"].items()}
+        net.load_state_dict(sd)
+        self.net = net.to(self.device).eval()
+        self.is_transformer = isinstance(self.net, PokerTransformerPolicyNet)
+        self.state_width = int(getattr(self.net, "lstm_hidden", TRANSFORMER_STATE_WIDTH))
+        self.deterministic = deterministic
+        self.h = torch.zeros((1, 1, self.state_width), device=self.device, dtype=torch.float32)
+        self.c = torch.zeros((1, 1, self.state_width), device=self.device, dtype=torch.float32)
+        self._preflop_cache: dict[tuple[Any, ...], np.ndarray] = {}
+
+    def reset_state(self) -> None:
+        self.h.zero_()
+        self.c.zero_()
+
+    def _pack_history(self, history: list[tuple[int, int, int, int]]) -> np.ndarray:
+        h_one = np.zeros((1, 1, self.state_width), dtype=np.float32)
+        if not self.is_transformer:
+            return h_one
+        n = min(len(history), TRANSFORMER_MAX_TOKENS)
+        for i in range(n):
+            pid, act, bkt, stg = history[i]
+            base = i * 4
+            h_one[0, 0, base + 0] = float(max(0, min(2, pid + 1)))
+            h_one[0, 0, base + 1] = float(max(0, min(const.NUM_ACTIONS, act + 1)))
+            h_one[0, 0, base + 2] = float(
+                max(0, min(NUM_RAISE_BUCKETS, (bkt if act == const.ACTION_RAISE else 0) + 1))
+            )
+            h_one[0, 0, base + 3] = float(max(0, min(const.NUM_STAGES, stg + 1)))
+        h_one[0, 0, TRANSFORMER_MAX_TOKENS * 4] = float(n)
+        return h_one
+
+    def set_transformer_history(self, history: list[tuple[int, int, int, int]]) -> None:
+        if not self.is_transformer:
+            return
+        self.h = self.torch.from_numpy(self._pack_history(history)).to(self.device)
+
+    def act(self, obs: dict[str, np.ndarray]) -> tuple[int, int]:
+        torch = self.torch
+        with torch.no_grad():
+            cards = torch.from_numpy(obs["cards"].reshape(1, 7).astype(np.int64)).to(self.device)
+            scalars = torch.from_numpy(obs["scalars"].reshape(1, 17)).to(self.device)
+            mask = torch.from_numpy(obs["action_mask"].reshape(1, 4)).to(self.device)
+            out = self.net.forward_step(  # type: ignore[operator]
+                cards=cards,
+                scalars=scalars,
+                action_mask=mask,
+                h=self.h,
+                c=self.c,
+                deterministic=self.deterministic,
+            )
+            self.h = out.h
+            self.c = out.c
+            return int(out.action_type[0].item()), int(out.raise_bucket[0].item())
+
+    def action_likelihoods_for_combos(
+        self,
+        *,
+        combo_indices: np.ndarray,
+        board: list[int],
+        scalars_1d: np.ndarray,
+        action_mask_1d: np.ndarray,
+        history: list[tuple[int, int, int, int]],
+        taken_action: int,
+        taken_bucket: int,
+    ) -> np.ndarray:
+        torch = self.torch
+        is_preflop_full = (
+            self.is_transformer and len(board) == 0 and len(combo_indices) == len(COMBO_C0)
+        )
+        cache_key: tuple[Any, ...] | None = None
+        if is_preflop_full:
+            cache_key = (
+                tuple(np.round(scalars_1d, 5).tolist()),
+                tuple(bool(x) for x in action_mask_1d.tolist()),
+                tuple(history),
+                int(taken_action),
+                int(taken_bucket),
+            )
+            cached = self._preflop_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        if self.is_transformer:
+            canon_cards = _canonicalize_combos_np(combo_indices, board)
+            uniq_cards, inv = np.unique(canon_cards, axis=0, return_inverse=True)
+            cards_np = uniq_cards.astype(np.int64)
+            n_eval = cards_np.shape[0]
+        else:
+            n_eval = len(combo_indices)
+            cards_np = np.full((n_eval, 7), -1, dtype=np.int64)
+            cards_np[:, 0] = COMBO_C0[combo_indices]
+            cards_np[:, 1] = COMBO_C1[combo_indices]
+            for i, bc in enumerate(board[:5]):
+                cards_np[:, 2 + i] = int(bc)
+            inv = None
+
+        h_one = self._pack_history(history)
+        with torch.no_grad():
+            cards_t = torch.from_numpy(cards_np).to(self.device)
+            scalars_t = (
+                torch.from_numpy(scalars_1d.reshape(1, 17))
+                .to(self.device)
+                .expand(n_eval, 17)
+                .contiguous()
+            )
+            mask_t = (
+                torch.from_numpy(action_mask_1d.reshape(1, 4))
+                .to(self.device)
+                .expand(n_eval, 4)
+                .contiguous()
+            )
+            h_t = (
+                torch.from_numpy(h_one)
+                .to(self.device)
+                .expand(1, n_eval, self.state_width)
+                .contiguous()
+            )
+            c_t = torch.zeros(
+                (1, n_eval, self.state_width), device=self.device, dtype=torch.float32
+            )
+            act_t = torch.full((n_eval,), int(taken_action), device=self.device, dtype=torch.int64)
+            bkt_t = torch.full((n_eval,), int(taken_bucket), device=self.device, dtype=torch.int64)
+            eo = self.net.evaluate_step(  # type: ignore[operator]
+                cards=cards_t,
+                scalars=scalars_t,
+                action_mask=mask_t,
+                action_type=act_t,
+                raise_bucket=bkt_t,
+                h=h_t,
+                c=c_t,
+            )
+            p_act = torch.exp(eo.logprob.to(dtype=torch.float32)).cpu().numpy()
+
+        res = p_act[inv].astype(np.float32) if inv is not None else p_act.astype(np.float32)
+        if cache_key is not None and len(self._preflop_cache) < 512:
+            self._preflop_cache[cache_key] = res
+        return res
 
 
 def compute_river_beliefs(
     *,
-    policy: OnnxPolicy,
+    policy: OnnxPolicy | TorchPolicy,
     button: int,
     action_str: str,
     board_per_street: list[list[int]],
+    min_weight_ratio: float = 0.02,
+    keep_combo: int | None = None,
 ) -> BeliefTracker:
-    """Replay public history through `policy` to compute Bayesian ranges for both seats."""
+    """Replay public history through `policy` to compute Bayesian ranges for both seats.
+
+    On postflop streets, combos whose current reach weight is below
+    `min_weight_ratio * mean_active_weight` are skipped during batched ONNX
+    inference (while keeping `keep_combo`), cutting turn/river inference cost.
+    """
     bt = BeliefTracker(smoothing=5e-4)
     st = HUNLState(button=button, hero_seat=0, hole_cards_hero=[0, 1])
     tokens = parse_action_tokens(action_str)
@@ -667,8 +901,19 @@ def compute_river_beliefs(
         else:
             continue
 
+        # On postflop streets, skip combos already pruned to near-zero probability mass.
+        eval_combos = active_combos
+        if len(cur_board) > 0 and min_weight_ratio > 0.0:
+            w = bt.ranges[p][active_combos]
+            thresh = float(w.mean()) * min_weight_ratio
+            keep = w >= thresh
+            if keep_combo is not None:
+                keep = keep | (active_combos == int(keep_combo))
+            if np.any(keep) and not np.all(keep):
+                eval_combos = active_combos[keep]
+
         lik = policy.action_likelihoods_for_combos(
-            combo_indices=active_combos,
+            combo_indices=eval_combos,
             board=cur_board,
             scalars_1d=obs_pub["scalars"],
             action_mask_1d=obs_pub["action_mask"],
@@ -676,7 +921,7 @@ def compute_river_beliefs(
             taken_action=act,
             taken_bucket=bkt,
         )
-        bt.update_action(p, lik, active_indices=active_combos)
+        bt.update_action(p, lik, active_indices=eval_combos)
         history.append((p, act, bkt, stage))
         st.apply(act, amount=delta)
 
@@ -724,21 +969,40 @@ def _board_per_street(board_strs: list[str]) -> list[list[int]]:
 
 
 def run(
-    model_path: str,
-    n_hands: int,
+    model_path: str | None = None,
+    n_hands: int = 1000,
     deterministic: bool = True,
     verbose: bool = False,
     river_search: bool = False,
-    search_iters: int = 200,
+    search_iters: int = 100,
+    search_max_raises: int = 2,
+    intra_threads: int = 0,
+    checkpoint_path: str | None = None,
+    config_path: str | None = None,
+    device: str = "cpu",
 ) -> None:
-    policy = OnnxPolicy(model_path, deterministic=deterministic)
+    policy: OnnxPolicy | TorchPolicy
+    if checkpoint_path is not None:
+        policy = TorchPolicy(
+            checkpoint_path,
+            config_path=config_path,
+            device=device,
+            deterministic=deterministic,
+        )
+    elif model_path is not None:
+        policy = OnnxPolicy(model_path, deterministic=deterministic, intra_threads=intra_threads)
+    else:
+        raise ValueError("Provide either --model (ONNX) or --checkpoint (PyTorch)")
     solver = (
-        RiverDCFRSolver(bet_fractions=(0.33, 0.75, 1.5), max_raises=3) if river_search else None
+        RiverDCFRSolver(bet_fractions=(0.5, 1.0), max_raises=search_max_raises)
+        if river_search
+        else None
     )
     s = requests.Session()
 
     chip_total = 0
     hands_played = 0
+    errored_hands = 0
     deltas: list[int] = []
     t0 = time.perf_counter()
     token = ""
@@ -767,6 +1031,7 @@ def run(
             hole_cards_hero=hole,
         )
         policy.reset_state()
+        hand_errored = False
 
         try:
             hist = replay_history(state, action_str, _board_per_street(board))
@@ -774,6 +1039,8 @@ def run(
         except Exception as e:
             print(f"[hand {hand_i}] replay failed on initial state: {e}")
             print(f"  action={action_str!r} board={board} hole={data['hole_cards']}")
+            errored_hands += 1
+            token = ""
             continue
 
         # Loop: while it's our turn, act. Then poll Slumbot for next state.
@@ -789,8 +1056,10 @@ def run(
             if state.active_player != hero_seat:
                 print(
                     f"[hand {hand_i}] WARNING: replay left active={state.active_player} "
-                    f"hero={hero_seat} action={action_str!r}"
+                    f"hero={hero_seat} action={action_str!r} raw={data}"
                 )
+                hand_errored = True
+                token = ""
                 break
 
             obs = encode_obs(state)
@@ -799,11 +1068,13 @@ def run(
             if solver is not None and state.stage == const.STAGE_RIVER and len(board) == 5:
                 try:
                     bps = _board_per_street(board)
+                    hero_cid = combo_id(hole[0], hole[1])
                     bt = compute_river_beliefs(
                         policy=policy,
                         button=button,
                         action_str=action_str,
                         board_per_street=bps,
+                        keep_combo=hero_cid,
                     )
                     res = solver.solve(
                         board=bps[3],
@@ -818,6 +1089,8 @@ def run(
                         last_raise=state.last_raise,
                         big_blind=state.bb_chips,
                         iterations=search_iters,
+                        prune_eps=1e-4,
+                        keep_combo=hero_cid,
                     )
                     probs = res.action_probs_for_hand(state.hole_cards_hero)
                     probs = probs / max(1e-12, float(probs.sum()))
@@ -865,6 +1138,17 @@ def run(
                 data = slumbot_act(s, token, incr)
             except requests.HTTPError as e:
                 print(f"[hand {hand_i}] HTTP error from Slumbot: {e}")
+                hand_errored = True
+                token = ""
+                break
+
+            if "error_msg" in data:
+                print(
+                    f"[hand {hand_i}] Slumbot error on incr={incr!r} "
+                    f"(prev_action={action_str!r}): {data['error_msg']}"
+                )
+                hand_errored = True
+                token = ""
                 break
 
             # New state from Slumbot.
@@ -877,23 +1161,21 @@ def run(
                 state.reward_hero = delta
                 # Don't bother re-replaying the final villain actions; we trust Slumbot.
                 break
-            # Re-replay full history into a fresh HUNLState to advance past
-            # villain's latest action. The state machine is deterministic so
-            # this just gives us the up-to-date pot / bets / stage. We do NOT
-            # reset the policy's LSTM hidden state — it carries across hero
-            # turns within a hand (the training pipeline only updates h/c when
-            # the active player acts; we did exactly one update above when we
-            # called policy.act, so the next hero turn's h/c starts from there).
             state = HUNLState(button=button, hero_seat=hero_seat, hole_cards_hero=hole)
             try:
                 hist = replay_history(state, action_str, _board_per_street(board))
                 policy.set_transformer_history(hist)
             except Exception as e:
                 print(f"[hand {hand_i}] mid-hand replay failed: {e}")
+                hand_errored = True
+                token = ""
                 break
 
-        # Slumbot's "winnings" field is the chip delta for the client. If we never
-        # got it (e.g., bailed out), fall back to our local reward estimate.
+        if hand_errored:
+            errored_hands += 1
+            continue
+
+        # Slumbot's "winnings" field is the chip delta for the client.
         delta = data.get("winnings", state.reward_hero) if data else state.reward_hero
         chip_total += int(delta)
         hands_played += 1
@@ -921,13 +1203,28 @@ def run(
     ci_lo = bb_per_100 - 1.96 * se
     ci_hi = bb_per_100 + 1.96 * se
     print(f"bb/100:          {bb_per_100:+.3f} ± {se:.3f}  (95% CI: {ci_lo:+.2f} .. {ci_hi:+.2f})")
+    if errored_hands:
+        print(f"errored hands skipped: {errored_hands}")
     if river_search:
         print(f"river DCFR solves: {river_solves}")
 
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--model", required=True, type=str, help="Path to exported .onnx file.")
+    p.add_argument("--model", type=str, default=None, help="Path to exported .onnx file.")
+    p.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to PyTorch .pt checkpoint (faster than ONNX for --river-search).",
+    )
+    p.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional Hydra YAML config for --checkpoint (e.g. conf/train_rnad.yaml).",
+    )
+    p.add_argument("--device", type=str, default="cpu", help="Device for --checkpoint (cpu/cuda).")
     p.add_argument("--hands", type=int, default=1000)
     p.add_argument("--stochastic", action="store_true", help="Sample instead of argmax.")
     p.add_argument(
@@ -935,16 +1232,28 @@ def main() -> int:
         action="store_true",
         help="Solve river spots online with Bayesian belief tracking + DCFR subgame solving.",
     )
-    p.add_argument("--search-iters", type=int, default=200, help="DCFR iterations per river solve.")
+    p.add_argument("--search-iters", type=int, default=100, help="DCFR iterations per river solve.")
+    p.add_argument("--search-max-raises", type=int, default=2, help="Max raises in river subgame.")
+    p.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="ONNX Runtime intra-op CPU threads (0 = runtime default).",
+    )
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
     run(
-        args.model,
+        model_path=args.model,
         n_hands=int(args.hands),
         deterministic=not args.stochastic,
         verbose=args.verbose,
         river_search=bool(args.river_search),
         search_iters=int(args.search_iters),
+        search_max_raises=int(args.search_max_raises),
+        intra_threads=int(args.threads),
+        checkpoint_path=args.checkpoint,
+        config_path=args.config,
+        device=str(args.device),
     )
     return 0
 

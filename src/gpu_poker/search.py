@@ -149,6 +149,23 @@ def unblocked_combo_indices(dead_cards: list[int] | np.ndarray) -> np.ndarray:
     return np.nonzero(mask)[0].astype(np.int32)
 
 
+def _disjoint_mass(
+    opp_r: np.ndarray,
+    c0: np.ndarray,
+    c1: np.ndarray,
+) -> np.ndarray:
+    """Exact `O(H)` inclusion-exclusion equivalent of `d_mat @ opp_r`.
+
+    For combo `h = (c0[h], c1[h])`, the total weight of opponent combos sharing
+    no card with `h` is `sum(r) - card_sum[c0] - card_sum[c1] + r[h]`.
+    """
+    total = float(opp_r.sum())
+    card_sum = np.bincount(c0, weights=opp_r, minlength=52) + np.bincount(
+        c1, weights=opp_r, minlength=52
+    )
+    return (total - card_sum[c0] - card_sum[c1] + opp_r).astype(np.float32)
+
+
 def build_river_matrices(
     combo_indices: np.ndarray,
     hand_ranks: np.ndarray,
@@ -173,6 +190,22 @@ def build_river_matrices(
     d_mat = disjoint.astype(np.float32)
     s_mat = r_cmp * d_mat
     return s_mat, d_mat
+
+
+def _build_showdown_matrix(
+    c0: np.ndarray,
+    c1: np.ndarray,
+    hand_ranks: np.ndarray,
+) -> np.ndarray:
+    """Build only the `[H, H]` showdown sign matrix `S` (disjoint folds use O(H) bincount)."""
+    disjoint = (
+        (c0[:, None] != c0[None, :])
+        & (c0[:, None] != c1[None, :])
+        & (c1[:, None] != c0[None, :])
+        & (c1[:, None] != c1[None, :])
+    )
+    r_cmp = np.sign(hand_ranks[:, None] - hand_ranks[None, :]).astype(np.float32)
+    return np.where(disjoint, r_cmp, np.float32(0.0))
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +418,8 @@ class RiverDCFRSolver:
         big_blind: int = 100,
         iterations: int = 200,
         compute_exploitability: bool = False,
+        prune_eps: float = 0.0,
+        keep_combo: int | None = None,
     ) -> RiverSolveResult:
         """Solve the river subgame from the current state and return root strategy.
 
@@ -395,24 +430,41 @@ class RiverDCFRSolver:
             bets: `(bet_p0, bet_p1)` current river-street bets already posted.
             active_player: `0` or `1`.
             range_p0, range_p1: `[1326]` (or `[H]`) non-negative reach weights.
-            iterations: number of alternating DCFR iterations (200-400 is tight).
+            iterations: number of alternating DCFR iterations (100-300 is tight).
+            prune_eps: drop combos where both players have reach <= prune_eps
+                (0.0 drops exact-zero combos only, which is mathematically lossless).
+            keep_combo: optional combo id in `[0, 1326)` always retained even if pruned.
         """
         combo_idx = unblocked_combo_indices(board)
-        h_count = len(combo_idx)
-        hole_pairs = np.stack([COMBO_C0[combo_idx], COMBO_C1[combo_idx]], axis=1)
-        ranks = self.evaluator.eval_river_combos(hole_pairs, board)
-        s_mat, d_mat = build_river_matrices(combo_idx, ranks)
-
         r0 = np.asarray(range_p0, dtype=np.float32)
         r1 = np.asarray(range_p1, dtype=np.float32)
-        if r0.shape == (NUM_COMBOS,):
-            r0 = r0[combo_idx].copy()
-        if r1.shape == (NUM_COMBOS,):
-            r1 = r1[combo_idx].copy()
+        r0 = r0[combo_idx].copy() if r0.shape == (NUM_COMBOS,) else r0.copy()
+        r1 = r1[combo_idx].copy() if r1.shape == (NUM_COMBOS,) else r1.copy()
         if r0.sum() <= 0 or r1.sum() <= 0:
             raise ValueError("Ranges must have positive total weight on unblocked combos")
         r0 = r0 / r0.sum()
         r1 = r1 / r1.sum()
+
+        # Drop combos with negligible/zero weight in both ranges to shrink the showdown matrix
+        # without changing any active combo's counterfactual values.
+        keep = (r0 > prune_eps) | (r1 > prune_eps)
+        if keep_combo is not None:
+            keep = keep | (combo_idx == int(keep_combo))
+        if not np.all(keep) and np.any(keep):
+            combo_idx = combo_idx[keep]
+            r0 = r0[keep]
+            r1 = r1[keep]
+            if r0.sum() > 0:
+                r0 = r0 / r0.sum()
+            if r1.sum() > 0:
+                r1 = r1 / r1.sum()
+
+        h_count = len(combo_idx)
+        c0 = COMBO_C0[combo_idx]
+        c1 = COMBO_C1[combo_idx]
+        hole_pairs = np.stack([c0, c1], axis=1)
+        ranks = self.evaluator.eval_river_combos(hole_pairs, board)
+        s_mat = _build_showdown_matrix(c0, c1, ranks)
 
         # Folded/committed root pot accounts for pot + already-matched river bets.
         root_pot = float(pot + bets[0] + bets[1])
@@ -443,7 +495,8 @@ class RiverDCFRSolver:
                 r1,
                 update_player=0,
                 s_mat=s_mat,
-                d_mat=d_mat,
+                c0=c0,
+                c1=c1,
                 pos_disc=pos_disc,
                 strat_w=strat_w,
             )
@@ -453,7 +506,8 @@ class RiverDCFRSolver:
                 r1,
                 update_player=1,
                 s_mat=s_mat,
-                d_mat=d_mat,
+                c0=c0,
+                c1=c1,
                 pos_disc=pos_disc,
                 strat_w=strat_w,
             )
@@ -463,7 +517,7 @@ class RiverDCFRSolver:
 
         expl = 0.0
         if compute_exploitability:
-            expl = self._compute_exploitability(root, r0, r1, s_mat, d_mat)
+            expl = self._compute_exploitability(root, r0, r1, s_mat, c0, c1)
 
         return RiverSolveResult(
             actions=root.actions,
@@ -481,25 +535,23 @@ class RiverDCFRSolver:
         *,
         update_player: int,
         s_mat: np.ndarray,
-        d_mat: np.ndarray,
+        c0: np.ndarray,
+        c1: np.ndarray,
         pos_disc: float,
         strat_w: float,
     ) -> np.ndarray:
         """Return counterfactual value vector `[H]` for `update_player`."""
         if node.kind == "showdown":
             opp_r = r1 if update_player == 0 else r0
-            # At showdown, matched investment c0 == c1 = T.
             t_chips = node.c0 if update_player == 0 else node.c1
             return (t_chips * (s_mat @ opp_r)).astype(np.float32)
 
         if node.kind == "fold":
             opp_r = r1 if update_player == 0 else r0
-            disjoint_mass = d_mat @ opp_r
+            disjoint_mass = _disjoint_mass(opp_r, c0, c1)
             if node.player == update_player:
-                # update_player folded -> loses their committed chips.
                 loss = node.c0 if update_player == 0 else node.c1
                 return (-loss * disjoint_mass).astype(np.float32)
-            # opponent folded -> update_player wins opponent's committed chips.
             gain = node.c1 if update_player == 0 else node.c0
             return (gain * disjoint_mass).astype(np.float32)
 
@@ -517,7 +569,8 @@ class RiverDCFRSolver:
                         r1,
                         update_player=0,
                         s_mat=s_mat,
-                        d_mat=d_mat,
+                        c0=c0,
+                        c1=c1,
                         pos_disc=pos_disc,
                         strat_w=strat_w,
                     )
@@ -528,7 +581,8 @@ class RiverDCFRSolver:
                         r1 * strat[a_idx],
                         update_player=1,
                         s_mat=s_mat,
-                        d_mat=d_mat,
+                        c0=c0,
+                        c1=c1,
                         pos_disc=pos_disc,
                         strat_w=strat_w,
                     )
@@ -552,7 +606,8 @@ class RiverDCFRSolver:
                     r1,
                     update_player=update_player,
                     s_mat=s_mat,
-                    d_mat=d_mat,
+                    c0=c0,
+                    c1=c1,
                     pos_disc=pos_disc,
                     strat_w=strat_w,
                 )
@@ -563,7 +618,8 @@ class RiverDCFRSolver:
                     r1 * strat[a_idx],
                     update_player=update_player,
                     s_mat=s_mat,
-                    d_mat=d_mat,
+                    c0=c0,
+                    c1=c1,
                     pos_disc=pos_disc,
                     strat_w=strat_w,
                 )
@@ -576,7 +632,8 @@ class RiverDCFRSolver:
         *,
         br_player: int,
         s_mat: np.ndarray,
-        d_mat: np.ndarray,
+        c0: np.ndarray,
+        c1: np.ndarray,
     ) -> np.ndarray:
         """Exact best-response counterfactual value `[H]` for `br_player` vs average strategy."""
         if node.kind == "showdown":
@@ -584,7 +641,7 @@ class RiverDCFRSolver:
             return (t_chips * (s_mat @ opp_r)).astype(np.float32)
 
         if node.kind == "fold":
-            disjoint_mass = d_mat @ opp_r
+            disjoint_mass = _disjoint_mass(opp_r, c0, c1)
             if node.player == br_player:
                 loss = node.c0 if br_player == 0 else node.c1
                 return (-loss * disjoint_mass).astype(np.float32)
@@ -594,7 +651,7 @@ class RiverDCFRSolver:
         assert node.strategy_sum is not None
         if node.player == br_player:
             vals = [
-                self._best_response_value(ch, opp_r, br_player=br_player, s_mat=s_mat, d_mat=d_mat)
+                self._best_response_value(ch, opp_r, br_player=br_player, s_mat=s_mat, c0=c0, c1=c1)
                 for ch in node.children
             ]
             return np.max(np.stack(vals, axis=0), axis=0)
@@ -603,7 +660,7 @@ class RiverDCFRSolver:
         total = np.zeros(opp_r.shape[0], dtype=np.float32)
         for a_idx, ch in enumerate(node.children):
             total += self._best_response_value(
-                ch, opp_r * avg_strat[a_idx], br_player=br_player, s_mat=s_mat, d_mat=d_mat
+                ch, opp_r * avg_strat[a_idx], br_player=br_player, s_mat=s_mat, c0=c0, c1=c1
             )
         return total
 
@@ -613,17 +670,18 @@ class RiverDCFRSolver:
         r0: np.ndarray,
         r1: np.ndarray,
         s_mat: np.ndarray,
-        d_mat: np.ndarray,
+        c0: np.ndarray,
+        c1: np.ndarray,
     ) -> float:
         """Exact subgame exploitability `(BR_0 + BR_1) / (2 * Z)` in chips."""
-        z = float(r0 @ (d_mat @ r1))
+        z = float(np.dot(r0, _disjoint_mass(r1, c0, c1)))
         if z <= 1e-12:
             return 0.0
         br0 = float(
-            np.dot(r0, self._best_response_value(root, r1, br_player=0, s_mat=s_mat, d_mat=d_mat))
+            np.dot(r0, self._best_response_value(root, r1, br_player=0, s_mat=s_mat, c0=c0, c1=c1))
         )
         br1 = float(
-            np.dot(r1, self._best_response_value(root, r0, br_player=1, s_mat=s_mat, d_mat=d_mat))
+            np.dot(r1, self._best_response_value(root, r0, br_player=1, s_mat=s_mat, c0=c0, c1=c1))
         )
         return max(0.0, 0.5 * (br0 + br1) / z)
 
