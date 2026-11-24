@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 if TYPE_CHECKING:
-    from train.train import TrainConfig
+    from train.config import TrainConfig
 
 logger = logging.getLogger(__name__)
 

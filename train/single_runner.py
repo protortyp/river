@@ -1,61 +1,45 @@
+"""Single-net self-play and NFSP-lite league PPO runner."""
+
 from __future__ import annotations
 
 import copy
-import json
 import os
-import socket
 import sys
 import time
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
 from tqdm import tqdm
 
-# Allow running `uv run train/train.py` (script mode) while still importing `train.*`.
-# When executed as a script, Python puts `.../repo/train` on `sys.path` first, which
-# can cause `import train.*` to resolve to `train/train.py` (a module) instead of
-# the `train/` package. Force the repo root to be first on `sys.path`.
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-repo_root_str = str(_REPO_ROOT)
-if not sys.path or sys.path[0] != repo_root_str:
-    sys.path.insert(0, repo_root_str)
-
-from gpu_poker import constants as c  # noqa: E402
-from gpu_poker.env import WarpPokerEnv  # noqa: E402
-from gpu_poker.policy import (  # noqa: E402
-    NUM_RAISE_BUCKETS,
-    PokerPolicyNet,
-    raise_bucket_to_amount,
+from gpu_poker import constants as c
+from gpu_poker.env import WarpPokerEnv
+from gpu_poker.policy import NUM_RAISE_BUCKETS, raise_bucket_to_amount
+from train import bots as train_bots
+from train.buffer import RolloutBuffer
+from train.checkpointing import CheckpointState, load_checkpoint, save_checkpoint
+from train.config import TrainConfig, TrainResult
+from train.eval import (
+    eval_vs_bot,
+    eval_vs_bot_seat_swap,
+    eval_vs_policy,
+    eval_vs_snapshot_mix_seat_swap,
 )
-
-try:
-    from train import bots as train_bots  # type: ignore[attr-defined]
-    from train.eval import (  # type: ignore[attr-defined]
-        eval_vs_bot,
-        eval_vs_bot_seat_swap,
-        eval_vs_policy,
-        eval_vs_snapshot_mix_seat_swap,
-    )
-except ModuleNotFoundError:  # pragma: no cover
-    # Fallback for environments where `train` resolves incorrectly.
-    import bots as train_bots  # type: ignore[no-redef]
-    from eval import (  # type: ignore[no-redef]
-        eval_vs_bot,
-        eval_vs_bot_seat_swap,
-        eval_vs_policy,
-        eval_vs_snapshot_mix_seat_swap,
-    )
-
-from train.checkpointing import CheckpointState, load_checkpoint, save_checkpoint  # noqa: E402
-from train.league import (  # noqa: E402
-    OpponentMeta,
-    UnifiedOpponentPool,
-    pfsp_weights_for_exploiter,
-    pfsp_weights_from_bb_per_hand,
+from train.league import OpponentMeta, UnifiedOpponentPool, pfsp_weights_from_bb_per_hand
+from train.policy_factory import (
+    PolicyNet,
+    load_snapshot_model,
 )
-from train.ppo_utils import (  # noqa: E402
+from train.policy_factory import (
+    make_policy as _make_policy,
+)
+from train.policy_factory import (
+    push_transformer_token as _push_transformer_token,
+)
+from train.policy_factory import (
+    stage_from_scalars as _stage_from_scalars,
+)
+from train.ppo_utils import (
     action_stats,
     action_stats_by_street,
     action_stats_masked,
@@ -83,211 +67,7 @@ except ModuleNotFoundError:
     pynvml = None
     _HAS_PYNVML = False
 
-try:
-    import hydra
-    from hydra.core.config_store import ConfigStore
-    from omegaconf import OmegaConf
-
-    _HAS_HYDRA = True
-except ModuleNotFoundError:  # pragma: no cover
-    hydra = None  # type: ignore[assignment]
-    ConfigStore = None  # type: ignore[assignment]
-    OmegaConf = None  # type: ignore[assignment]
-    _HAS_HYDRA = False
-
-
-def load_snapshot_model(
-    path: str, device: torch.device, cfg: TrainConfig, scalar_dim: int
-) -> PokerPolicyNet:
-    """Robustly load a snapshot model, handling potential torch.compile prefixes.
-
-    Strict load: a shape or key mismatch raises immediately. Stale snapshots
-    (e.g., from before a model-architecture change) fail with a clear
-    shape-mismatch hint.
-    """
-    ckpt = torch.load(path, map_location=device)
-    # Clean state dict if it's from a compiled model
-    state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
-
-    net = PokerPolicyNet(
-        scalar_dim=scalar_dim,
-        card_embed_dim=cfg.card_embed_dim,
-        mlp_dim=cfg.mlp_dim,
-        torso_layers=cfg.torso_layers,
-        lstm_hidden=cfg.lstm_hidden,
-        head_layers=cfg.head_layers,
-        head_dim=cfg.head_dim,
-    ).to(device=device)
-    try:
-        net.load_state_dict(state_dict)
-    except RuntimeError as e:
-        raise RuntimeError(
-            f"Failed to load snapshot at {path}; the architecture likely "
-            f"changed since this snapshot was saved. Clear stale snapshots "
-            f"from the league pool and resume."
-        ) from e
-    net.eval()
-    return net
-
-
-@dataclass(frozen=True)
-class TrainConfig:
-    device: str
-    num_envs: int
-    rollout_steps: int
-    # Termination: prefer `total_env_steps` (set >0). `num_updates` is an
-    # alternative but not recommended.
-    total_env_steps: int
-    num_updates: int
-    lr: float
-    gamma: float
-    gae_lambda: float
-    clip_eps: float
-    value_coef: float
-    entropy_coef: float
-    max_grad_norm: float
-    # Policy architecture
-    card_embed_dim: int
-    mlp_dim: int
-    torso_layers: int
-    lstm_hidden: int
-    head_layers: int
-    head_dim: int | None
-    num_epochs: int
-    minibatch_size: int
-    seed: int
-    # Logging / progress
-    log_every_env_steps: int
-    log_every_seconds: float
-    # Checkpointing
-    checkpoint_dir: str
-    save_every_env_steps: int
-    resume_from: str
-    eval_every: int
-    eval_hands: int
-    eval_max_steps: int
-    # League / opponent sampling (NFSP-lite). When enabled, training collects experience
-    # from learner-controlled actions against a mixture of opponents (bots + snapshot pool).
-    # It uses Monte-Carlo terminal returns (no GAE) to avoid leaking opponent hole cards
-    # through the critic on opponent-to-act timesteps (env observations are active-player).
-    league_enabled: bool
-    # Mixture policy:
-    # - with prob `league_eta_selfplay`, play vs the latest policy (self-play)
-    # - otherwise play vs a PFSP-weighted bot/snapshot from the unified pool
-    league_eta_selfplay: float
-    # Initial bb/hand for bots (0 = assume 50% win rate)
-    league_bot_initial_score: float
-    # Whether to evaluate vs bots for PFSP
-    league_eval_bots: bool
-    # How often to re-evaluate bots (in updates)
-    league_eval_bots_every: int
-    # Disk-backed snapshot pool (stored under `checkpoint_dir/league_pool`).
-    league_snapshot_pool: int
-    league_snapshot_every_updates: int
-    league_eval_every_updates: int
-    league_eval_hands: int
-    league_eval_subset: int
-    league_eval_deterministic: bool
-    league_eval_seat_swap: bool
-    league_pfsp_temperature: float
-    league_pfsp_epsilon: float
-    # Rollout performance: limit the number of distinct snapshot opponents sampled per hand.
-    # Large pools can otherwise cause many tiny per-snapshot forward passes and tank SPS.
-    league_rollout_snapshot_k: int
-    # Self-play evaluation vs snapshot pool (stronger than bots; detects plateaus).
-    # Requires `league_enabled=true` and `league_snapshot_pool>0`.
-    selfplay_eval_enabled: bool
-    selfplay_eval_every_updates: int
-    selfplay_eval_hands: int
-    selfplay_eval_subset: int
-    selfplay_eval_deterministic: bool
-    selfplay_eval_seat_swap: bool
-    # If true, synchronizes CUDA at phase boundaries when timing the update loop.
-    # Useful for diagnosing slowdowns, but adds overhead.
-    timing_sync: bool
-    # torch.compile() optimization for policy network (PyTorch 2.0+).
-    compile_policy: bool
-    # Automatic mixed precision (AMP) for faster training on modern GPUs.
-    use_amp: bool
-    # AMP dtype: "bfloat16" (recommended, no loss scaling needed) or "float16".
-    amp_dtype: str
-    # CUDA graphs for PPO update (experimental).
-    # Captures the PPO minibatch update as a CUDA graph for reduced CPU overhead.
-    # Requirements: minibatch_size must evenly divide (num_envs * rollout_steps).
-    # Note: Currently not compatible with league_enabled=true due to conditional logic.
-    use_cuda_graph: bool
-
-
-@dataclass(frozen=True)
-class TrainResult:
-    config: dict
-    env_steps: int
-    opt_steps: int
-    elapsed_s: float
-    overall_sps: float
-    mean_loss: float
-    approx_kl: float
-    clipfrac: float
-    value_loss: float
-    policy_loss: float
-    entropy: float
-    invalid_rate: float
-    eval: dict[str, float]
-
-
-class RolloutBuffer:
-    def __init__(
-        self,
-        *,
-        t: int,
-        n: int,
-        scalar_dim: int,
-        hidden: int,
-        device: torch.device,
-        dtype: torch.dtype = torch.float32,
-    ) -> None:
-        self.t = int(t)
-        self.n = int(n)
-        self.scalar_dim = int(scalar_dim)
-        self.hidden = int(hidden)
-        self.device = device
-        self.dtype = dtype
-
-        self.cards = torch.empty((t, n, 7), device=device, dtype=torch.int32)
-        self.scalars = torch.empty((t, n, scalar_dim), device=device, dtype=torch.float32)
-        self.action_mask = torch.empty((t, n, c.NUM_ACTIONS), device=device, dtype=torch.bool)
-        self.player_id = torch.empty((t, n), device=device, dtype=torch.int64)
-        self.episode_id = torch.empty((t, n), device=device, dtype=torch.int32)
-        self.reset_mask = torch.empty((t, n), device=device, dtype=torch.bool)
-        self.learner_mask = torch.empty((t, n), device=device, dtype=torch.bool)
-
-        self.action_type = torch.empty((t, n), device=device, dtype=torch.int64)
-        # Discrete raise-bucket index in [0, NUM_RAISE_BUCKETS); int64 storage so
-        # the replay-time Categorical.log_prob matches sample time exactly.
-        self.raise_bucket = torch.empty((t, n), device=device, dtype=torch.int64)
-        self.logprob = torch.empty((t, n), device=device, dtype=torch.float32)
-        self.value = torch.empty((t, n), device=device, dtype=torch.float32)
-
-        # Reward from the acting player's perspective.
-        self.reward = torch.empty((t, n), device=device, dtype=torch.float32)
-        # Terminal reward from P0 perspective (normalized); 0 on non-terminal steps.
-        self.reward_p0 = torch.empty((t, n), device=device, dtype=torch.float32)
-        self.done = torch.empty((t, n), device=device, dtype=torch.bool)
-
-        # Acting-player LSTM state at action time (already reset as needed).
-        self.h = torch.empty((t, n, hidden), device=device, dtype=torch.float32)
-        self.c = torch.empty((t, n, hidden), device=device, dtype=torch.float32)
-
-
-def run(cfg: TrainConfig) -> TrainResult:
-    use_nvml = _HAS_PYNVML and cfg.device.startswith("cuda")
-    if use_nvml:
-        pynvml.nvmlInit()
-    try:
-        return _run_impl(cfg)
-    finally:
-        if use_nvml:
-            pynvml.nvmlShutdown()
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _run_impl(cfg: TrainConfig) -> TrainResult:
@@ -309,19 +89,35 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
         torch.cuda.manual_seed_all(cfg.seed)
 
     device = torch.device(cfg.device)
-    env = WarpPokerEnv(num_envs=cfg.num_envs, device=cfg.device)
+    env = WarpPokerEnv(
+        num_envs=cfg.num_envs,
+        starting_stack=int(cfg.starting_stack),
+        small_blind=int(cfg.small_blind),
+        big_blind=int(cfg.big_blind),
+        device=cfg.device,
+    )
+    # Randomized per-env starting stack: teaches the policy stack-depth-aware
+    # play (40 BB push/fold all the way up to 200 BB 3-bet wars) instead of
+    # overfitting to one specific depth. Fixed stack if min == max.
+    if int(cfg.starting_stack_min) < int(cfg.starting_stack_max):
+        per_env_stack = torch.randint(
+            int(cfg.starting_stack_min),
+            int(cfg.starting_stack_max) + 1,
+            (cfg.num_envs,),
+            device=device,
+            dtype=torch.int32,
+        )
+        env.reset_with_config(starting_stack=per_env_stack)
+        print(
+            f"[env] randomized starting_stack in "
+            f"[{int(cfg.starting_stack_min)}, {int(cfg.starting_stack_max)}] chips "
+            f"({int(cfg.starting_stack_min) // int(cfg.big_blind)}-"
+            f"{int(cfg.starting_stack_max) // int(cfg.big_blind)} BB)"
+        )
     obs = env.reset()
 
     scalar_dim = int(obs["scalars"].shape[1])
-    net = PokerPolicyNet(
-        scalar_dim=scalar_dim,
-        card_embed_dim=cfg.card_embed_dim,
-        mlp_dim=cfg.mlp_dim,
-        torso_layers=cfg.torso_layers,
-        lstm_hidden=cfg.lstm_hidden,
-        head_layers=cfg.head_layers,
-        head_dim=cfg.head_dim,
-    ).to(device=device)
+    net = _make_policy(cfg, scalar_dim, device)
 
     if cfg.compile_policy:
         net = torch.compile(net, mode="reduce-overhead")  # type: ignore[assignment]
@@ -330,10 +126,34 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
     opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr, fused=True)
 
     # Automatic mixed precision (AMP) setup.
-    # BF16 is preferred: same exponent range as FP32, no loss scaling needed.
+    # BF16 is preferred (same exponent range as FP32, no loss scaling) but is only
+    # natively supported on Ampere+ (sm_80+). "auto" picks bf16 if hardware supports
+    # it, otherwise fp16 — important for V100 (sm_70) where bf16 has no hw acceleration.
     amp_dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
-    amp_dtype = amp_dtype_map.get(cfg.amp_dtype, torch.bfloat16)
+    if cfg.amp_dtype == "auto":
+        # Native bf16 requires compute capability >= 8.0 (Ampere). PyTorch's
+        # is_bf16_supported() returns True even on V100 (sm_70) because it can be
+        # emulated via fp32, but there's no perf benefit — and it can be slower
+        # than fp16 since fp16 has Tensor Core acceleration on V100.
+        cap = torch.cuda.get_device_capability() if cfg.device.startswith("cuda") else (0, 0)
+        if cap >= (8, 0):
+            amp_dtype = torch.bfloat16
+            print(f"[amp] auto -> bfloat16 (sm_{cap[0]}{cap[1]}, native hardware support)")
+        else:
+            amp_dtype = torch.float16
+            print(f"[amp] auto -> float16 (sm_{cap[0]}{cap[1]}, bf16 not hw-accelerated)")
+    else:
+        amp_dtype = amp_dtype_map.get(cfg.amp_dtype, torch.bfloat16)
     amp_enabled = cfg.use_amp and cfg.device.startswith("cuda")
+
+    # GradScaler is REQUIRED for fp16 to prevent gradient underflow (Micikevicius
+    # et al., "Mixed Precision Training", 2017). bf16 has the same exponent range
+    # as fp32 so no scaling is needed — enabling the scaler for bf16 would be a
+    # no-op pass-through but we explicitly disable it for clarity.
+    scaler_enabled = amp_enabled and amp_dtype == torch.float16
+    scaler = torch.amp.GradScaler(device="cuda", enabled=scaler_enabled)
+    if scaler_enabled:
+        print("[amp] GradScaler enabled (fp16 needs loss scaling to avoid underflow)")
 
     # League (NFSP-lite): sample opponents per-env at hand boundaries.
     # Encoding:
@@ -349,7 +169,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
     opponent_scores = torch.empty((0,), device=device, dtype=torch.float32)
     opponent_kinds = torch.empty((0,), device=device, dtype=torch.int64)
     opponent_filled = 0
-    snapshot_models: dict[str, PokerPolicyNet] = {}
+    snapshot_models: dict[str, PolicyNet] = {}
 
     if cfg.league_enabled:
         pool_dir = Path(cfg.checkpoint_dir) / "league_pool"
@@ -377,35 +197,6 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
         opponent_filled = min(len(opponent_metas), max_opponents)
     snapshot_adds = 0
 
-    def refresh_opponent_pool() -> None:
-        nonlocal opponent_metas, opponent_scores, opponent_kinds, opponent_filled
-        if pool is None:
-            return
-
-        new_metas = pool.load_index()
-        num_new = len(new_metas)
-
-        # Ensure tensors are large enough for the unified pool
-        current_max = len(bot_names) + cfg.league_snapshot_pool
-        target_max = max(current_max, num_new)
-
-        if target_max > opponent_scores.shape[0]:
-            new_scores = torch.zeros(target_max, device=device)
-            new_kinds = torch.zeros(target_max, device=device, dtype=torch.int64)
-
-            n_copy = opponent_scores.shape[0]
-            new_scores[:n_copy] = opponent_scores
-            new_kinds[:n_copy] = opponent_kinds
-
-            opponent_scores = new_scores
-            opponent_kinds = new_kinds
-
-        opponent_metas = new_metas
-        opponent_filled = len(new_metas)
-
-        for i, meta in enumerate(opponent_metas):
-            opponent_kinds[i] = 1 if meta.kind == "bot" else 2
-
     def resample_roles(mask: torch.Tensor) -> None:
         idx = torch.nonzero(mask.to(dtype=torch.bool), as_tuple=False).squeeze(-1)
         if idx.numel() == 0:
@@ -413,69 +204,79 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
         num = int(idx.numel())
 
         learner_seat[idx] = torch.randint(0, 2, (num,), device=device, dtype=torch.int64)
+        u = torch.rand((num,), device=device, dtype=torch.float32)
 
-        # Exploiter-specific opponent selection.
-        #
-        # Priority 1: main / main_historical snapshots fed in externally (the
-        # intended target).
-        # Priority 2: this exploiter's own past league_exploiter snapshots
-        # (self-play in exploiter mode when no main agents exist yet).
-        # Priority 3: scripted bots.
-        # Priority 4: a degenerate "no opp" sentinel.
-        main_indices = [
-            i
-            for i, meta in enumerate(opponent_metas)
-            if meta.agent_role in {"main", "main_historical"}
-        ]
-        exploiter_opp_indices = main_indices
-        if not exploiter_opp_indices:
-            exploiter_opp_indices = [
-                i
-                for i, meta in enumerate(opponent_metas)
-                if meta.kind == "snapshot" and meta.agent_role == "league_exploiter"
-            ]
+        is_selfplay = u < float(cfg.league_eta_selfplay)
+        want_opponent = ~is_selfplay
 
-        if not exploiter_opp_indices:
-            # No main or self snapshots — fall back to bots.
-            bot_indices = [i for i, meta in enumerate(opponent_metas) if meta.kind == "bot"]
-            if not bot_indices:
-                # Absolute fallback: self-play (should be rare)
-                opp_kind[idx] = 0
-                opp_id[idx] = 0
-                return
+        opp_kind[idx[is_selfplay]] = 0
+        opp_id[idx[is_selfplay]] = 0
 
-            bot_indices_t = torch.tensor(bot_indices, device=device, dtype=torch.int64)
-            choice = torch.randint(0, len(bot_indices_t), (num,), device=device)
-            final_opp_indices = bot_indices_t[choice]
+        # Opponent from unified pool (PFSP-weighted)
+        if want_opponent.any():
+            if opponent_filled > 0:
+                # Include main historical agents and exploiters. Scripted bots
+                # are only included if `league_train_on_bots=true` (false by
+                # default — bots are eval-only per the poker-AI SOTA recipes).
+                valid_indices = [
+                    i
+                    for i, meta in enumerate(opponent_metas[:opponent_filled])
+                    if meta.agent_role in {"main", "main_historical", "league_exploiter"}
+                    or (meta.kind == "bot" and cfg.league_train_on_bots)
+                ]
+                snapshot_indices = [
+                    i for i in valid_indices if opponent_metas[i].kind == "snapshot"
+                ]
+                max_rollout_snapshots = int(cfg.league_rollout_snapshot_k)
+                if max_rollout_snapshots > 0 and len(snapshot_indices) > max_rollout_snapshots:
+                    snap_t = torch.tensor(snapshot_indices, device=device, dtype=torch.int64)
+                    snap_weights = pfsp_weights_from_bb_per_hand(
+                        opponent_scores[snap_t],
+                        temperature=cfg.league_pfsp_temperature,
+                        epsilon=cfg.league_pfsp_epsilon,
+                        mode=cfg.league_pfsp_mode,
+                        q=cfg.league_pfsp_q,
+                    )
+                    snap_weights = snap_weights / snap_weights.sum().clamp_min(1e-12)
+                    picked = torch.multinomial(
+                        snap_weights,
+                        num_samples=max_rollout_snapshots,
+                        replacement=False,
+                    )
+                    picked_snapshots = set(snap_t[picked].tolist())
+                    valid_indices = [
+                        i
+                        for i in valid_indices
+                        if opponent_metas[i].kind == "bot" or i in picked_snapshots
+                    ]
 
-            opp_id[idx] = final_opp_indices
-            opp_kind[idx] = opponent_kinds[final_opp_indices]
-            return
+                if valid_indices:
+                    indices_t = torch.tensor(valid_indices, device=device, dtype=torch.int64)
+                    weights = pfsp_weights_from_bb_per_hand(
+                        opponent_scores[indices_t],
+                        temperature=cfg.league_pfsp_temperature,
+                        epsilon=cfg.league_pfsp_epsilon,
+                        mode=cfg.league_pfsp_mode,
+                        q=cfg.league_pfsp_q,
+                    )
+                    weights = weights / weights.sum().clamp_min(1e-12)
 
-        opp_indices_t = torch.tensor(exploiter_opp_indices, device=device, dtype=torch.int64)
-        opp_scores_t = opponent_scores[opp_indices_t]
+                    n_samples = int(want_opponent.sum().item())
+                    choice_idx = torch.multinomial(weights, num_samples=n_samples, replacement=True)
+                    choice = indices_t[choice_idx]
 
-        # `opponent_scores[i]` stores the *exploiter's* bb/hand vs opponent i
-        # (set by `eval_vs_policy(policy_p0=net, policy_p1=snap_net)` at the
-        # league-eval site). An exploiter should focus on opponents it
-        # currently loses to — bb < 0 — because those are the ones it needs to
-        # learn to beat. Use the monotone exploiter PFSP variant rather than
-        # the symmetric `p*(1-p)` used by main-league training (which would
-        # emphasize equal matchups instead).
-        weights = pfsp_weights_for_exploiter(
-            opp_scores_t,
-            temperature=cfg.league_pfsp_temperature,
-            epsilon=cfg.league_pfsp_epsilon,
-        )
-        weights = weights / weights.sum().clamp_min(1e-12)
+                    opp_id[idx[want_opponent]] = choice
+                    opp_kind[idx[want_opponent]] = opponent_kinds[choice]
+                else:
+                    # Fallback to bots/self-play if no specific roles found
+                    opp_kind[idx[want_opponent]] = 0
+                    opp_id[idx[want_opponent]] = 0
+            else:
+                # Fallback to self-play if pool is empty (shouldn't happen if bots exist)
+                opp_kind[idx[want_opponent]] = 0
+                opp_id[idx[want_opponent]] = 0
 
-        choice = torch.multinomial(weights, num_samples=num, replacement=True)
-
-        # Map choice back to original opponent indices
-        final_opp_indices = opp_indices_t[choice]
-
-        opp_id[idx] = final_opp_indices
-        opp_kind[idx] = opponent_kinds[final_opp_indices]
+        # opp_kind/opp_id were updated in place via slicing above.
 
     def _pick_snapshot_eval_ids(*, subset: int, k_recent: int = 4) -> list[int]:
         # Filter for snapshots only
@@ -550,11 +351,8 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
     c0 = torch.zeros((1, cfg.num_envs, net.lstm_hidden), device=device, dtype=state_dtype)
     h1 = torch.zeros((1, cfg.num_envs, net.lstm_hidden), device=device, dtype=state_dtype)
     c1 = torch.zeros((1, cfg.num_envs, net.lstm_hidden), device=device, dtype=state_dtype)
-    # Per-env LSTM state for the snapshot opponent. Snapshots were trained with
-    # an LSTM and produce very different (and trivially exploitable) actions
-    # when fed a fresh zero state every step. We carry (h, c) per env, reset
-    # on hand terminal (same time as h0/c0/h1/c1 below — opponent IDs are
-    # resampled there too, so the state belongs to a fresh opponent).
+    # Snapshot opponents are evaluated as memoryless during rollouts; feed constant zero state
+    # to avoid per-step allocations.
     snap_h0 = torch.zeros_like(h0)
     snap_c0 = torch.zeros_like(c0)
 
@@ -692,12 +490,6 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                     c0 = torch.where(reset.view(1, -1, 1), z, c0)
                     h1 = torch.where(reset.view(1, -1, 1), z, h1)
                     c1 = torch.where(reset.view(1, -1, 1), z, c1)
-                    # Snapshot opponent's state belongs to whichever snapshot
-                    # is assigned to this env; opponent IDs are resampled in
-                    # `resample_roles` below on the same reset mask, so we
-                    # zero snap state here to match.
-                    snap_h0 = torch.where(reset.view(1, -1, 1), z, snap_h0)
-                    snap_c0 = torch.where(reset.view(1, -1, 1), z, snap_c0)
                     if cfg.league_enabled:
                         resample_roles(reset)
 
@@ -720,15 +512,16 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                 buf.c[t].copy_(c_batch.squeeze(0))
 
                 if not cfg.league_enabled:
-                    out = net.forward_step(
-                        cards=obs["cards"],
-                        scalars=obs["scalars"],
-                        action_mask=obs["action_mask"],
-                        h=h_batch,
-                        c=c_batch,
-                        terminated=None,
-                        deterministic=False,
-                    )
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
+                        out = net.forward_step(
+                            cards=obs["cards"],
+                            scalars=obs["scalars"],
+                            action_mask=obs["action_mask"],
+                            h=h_batch,
+                            c=c_batch,
+                            terminated=None,
+                            deterministic=False,
+                        )
 
                     # Update the acting player's hidden state.
                     h0, c0, h1, c1 = scatter_player_state(
@@ -753,6 +546,17 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                         torch.zeros_like(amounts),
                     )
                     next_obs = env.step(out.action_type.to(dtype=torch.int32), amounts)
+
+                    if cfg.policy_backbone == "transformer":
+                        stage_at_action = _stage_from_scalars(buf.scalars[t])
+                        h0, h1 = _push_transformer_token(
+                            h0,
+                            h1,
+                            player_id=pid,
+                            action_type=out.action_type.to(dtype=torch.int32),
+                            raise_bucket=out.raise_bucket,
+                            stage=stage_at_action,
+                        )
 
                     bb = next_obs["big_blind"].to(dtype=torch.float32).clamp_min(1.0)
                     # Reward is always returned as P0 reward; map to acting player perspective.
@@ -793,6 +597,9 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                 action_type = torch.full(
                     (cfg.num_envs,), c.ACTION_FOLD, device=device, dtype=torch.int32
                 )
+                # Per-step staging tensors for the chosen action + ratio-sensitive
+                # log-prob / value (the rollout buffer keeps these in fp32 to
+                # avoid mixed-precision quantization breaking the PPO ratio).
                 raise_bucket = torch.zeros((cfg.num_envs,), device=device, dtype=torch.int64)
                 logprob = torch.zeros((cfg.num_envs,), device=device, dtype=torch.float32)
                 value = torch.zeros((cfg.num_envs,), device=device, dtype=torch.float32)
@@ -848,9 +655,11 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                         )
                         action_type[idx_b] = a_b
                         # Bots return a continuous fraction in [0, 1]; coarse-map
-                        # to a discrete bucket index for the raise space.
+                        # to a bucket index for the discrete action space. (This
+                        # path is normally inactive — bots are eval-only when
+                        # cfg.league_train_on_bots=false.)
                         bucket_b = (
-                            (rf_b.squeeze(-1).to(dtype=torch.float32) * (NUM_RAISE_BUCKETS - 1))
+                            (rf_b.to(dtype=torch.float32) * (NUM_RAISE_BUCKETS - 1))
                             .round()
                             .clamp_(0, NUM_RAISE_BUCKETS - 1)
                             .to(dtype=torch.int64)
@@ -862,6 +671,8 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                     for pool_idx in torch.unique(opp_id[snap_mask]).tolist():
                         pool_idx = int(pool_idx)
                         meta = opponent_metas[pool_idx]
+                        if meta.kind != "snapshot":
+                            continue
                         snap_path = os.path.join(cfg.checkpoint_dir, meta.id)
 
                         if snap_path not in snapshot_models:
@@ -886,15 +697,8 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                                 h=snap_h0[:, idx_s, :],
                                 c=snap_c0[:, idx_s, :],
                                 terminated=None,
-                                # Stochastic sampling matches how snapshots
-                                # behave at training/eval time. A deterministic
-                                # argmax opponent is trivially exploitable.
-                                deterministic=False,
+                                deterministic=True,
                             )
-                        # Persist updated LSTM state for this env subset so the
-                        # snapshot's memory carries across the hand.
-                        snap_h0[:, idx_s, :] = out_s.h.to(dtype=snap_h0.dtype)
-                        snap_c0[:, idx_s, :] = out_s.c.to(dtype=snap_c0.dtype)
                         action_type[idx_s] = out_s.action_type.to(dtype=torch.int32)
                         raise_bucket[idx_s] = out_s.raise_bucket.to(dtype=raise_bucket.dtype)
 
@@ -910,6 +714,17 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                     torch.zeros_like(amounts),
                 )
                 next_obs = env.step(action_type, amounts)
+
+                if cfg.policy_backbone == "transformer":
+                    stage_at_action = _stage_from_scalars(buf.scalars[t])
+                    h0, h1 = _push_transformer_token(
+                        h0,
+                        h1,
+                        player_id=pid,
+                        action_type=action_type,
+                        raise_bucket=raise_bucket,
+                        stage=stage_at_action,
+                    )
 
                 bb = next_obs["big_blind"].to(dtype=torch.float32).clamp_min(1.0)
                 reward_p0 = next_obs["rewards"].to(dtype=torch.float32) / (
@@ -940,18 +755,21 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
             if not cfg.league_enabled:
                 pid_last = obs["player_id"].to(dtype=torch.int64)
                 h_last, c_last = select_player_state(player_id=pid_last, h0=h0, c0=c0, h1=h1, c1=c1)
-                out_last = net.forward_step(
-                    cards=obs["cards"],
-                    scalars=obs["scalars"],
-                    action_mask=obs["action_mask"],
-                    h=h_last,
-                    c=c_last,
-                    terminated=None,
-                    deterministic=True,
-                )
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
+                    out_last = net.forward_step(
+                        cards=obs["cards"],
+                        scalars=obs["scalars"],
+                        action_mask=obs["action_mask"],
+                        h=h_last,
+                        c=c_last,
+                        terminated=None,
+                        deterministic=True,
+                    )
                 last_value = out_last.value
                 last_player_id = pid_last
             else:
+                # Bootstrap value path mirrors buf.value dtype (fp32) so the
+                # advantage computation has no implicit downcast.
                 last_value = torch.zeros((cfg.num_envs,), device=device, dtype=torch.float32)
                 last_player_id = torch.zeros((cfg.num_envs,), device=device, dtype=torch.int64)
 
@@ -1169,9 +987,13 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                 loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy_bonus
 
                 opt.zero_grad(set_to_none=True)
-                loss.backward()
+                scaler.scale(loss).backward()
+                # Unscale gradients before clipping so max_grad_norm is in the
+                # original (unscaled) gradient space.
+                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=cfg.max_grad_norm)
-                opt.step()
+                scaler.step(opt)
+                scaler.update()
                 opt_steps += 1
 
                 loss_sum_t = loss_sum_t + loss.detach()
@@ -1261,6 +1083,8 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                     opponent_scores[:opponent_filled],
                     temperature=cfg.league_pfsp_temperature,
                     epsilon=cfg.league_pfsp_epsilon,
+                    mode=cfg.league_pfsp_mode,
+                    q=cfg.league_pfsp_q,
                 )
                 w = w / w.sum().clamp_min(1e-12)
                 writer.add_scalar("league/pfsp_weight_min", float(w.min().item()), env_steps)
@@ -1489,11 +1313,13 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                     s_scores,
                     temperature=cfg.league_pfsp_temperature,
                     epsilon=cfg.league_pfsp_epsilon,
+                    mode=cfg.league_pfsp_mode,
+                    q=cfg.league_pfsp_q,
                 )
 
                 snap_policies = []
                 for i in snap_indices:
-                    path = opponent_metas[i].id
+                    path = os.path.join(cfg.checkpoint_dir, opponent_metas[i].id)
                     if path not in snapshot_models:
                         snapshot_models[path] = load_snapshot_model(path, device, cfg, scalar_dim)
                     snap_policies.append(snapshot_models[path])
@@ -1525,8 +1351,13 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
         ):
             if cfg.timing_sync:
                 sync(cfg.device)
+            # Demote previous main agent to historical
+            current_main = next((o for o in opponent_metas if o.agent_role == "main"), None)
+            if current_main is not None:
+                pool.update_role(opponent_id=current_main.id, new_role="main_historical")
+
             meta = pool.add_snapshot(
-                model=net, env_steps=env_steps, update=update, agent_role="league_exploiter"
+                model=net, env_steps=env_steps, update=update, agent_role="main"
             )
 
             # Update in-memory pool using ring buffer logic for snapshots
@@ -1561,12 +1392,11 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
         # League: periodic eval vs unified pool (for PFSP sampling weights).
         if (
             cfg.league_enabled
+            and opponent_filled > 0
             and cfg.league_eval_every_updates > 0
             and (update + 1) % int(cfg.league_eval_every_updates) == 0
         ):
-            refresh_opponent_pool()
-            if opponent_filled > 0:
-                was_training = net.training
+            was_training = net.training
             net.eval()
             try:
                 if cfg.timing_sync:
@@ -1645,7 +1475,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                     det = bool(cfg.league_eval_deterministic)
                     for i in eval_ids:
                         meta = opponent_metas[i]
-                        snap_path = meta.id
+                        snap_path = os.path.join(cfg.checkpoint_dir, meta.id)
 
                         if snap_path not in snapshot_models:
                             snapshot_models[snap_path] = load_snapshot_model(
@@ -1814,7 +1644,7 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
                         )
 
                         meta = opponent_metas[latest_i]
-                        snap_path = meta.id
+                        snap_path = os.path.join(cfg.checkpoint_dir, meta.id)
                         if snap_path not in snapshot_models:
                             snapshot_models[snap_path] = load_snapshot_model(
                                 snap_path, device, cfg, scalar_dim
@@ -1933,40 +1763,6 @@ def _run_impl(cfg: TrainConfig) -> TrainResult:
     )
 
 
-def main() -> int:
-    if not _HAS_HYDRA:  # pragma: no cover
-        raise ModuleNotFoundError("hydra-core is not installed")
-
-    ConfigStore.instance().store(name="train_config", node=TrainConfig)
-    conf_dir = str((_REPO_ROOT / "conf").resolve())
-
-    @hydra.main(version_base=None, config_path=conf_dir, config_name="train_exploiter")
-    def _hydra_main(cfg_dict) -> int:
-        cfg_obj = TrainConfig(**OmegaConf.to_container(cfg_dict, resolve=True))  # type: ignore[arg-type]
-        result = run(cfg_obj)
-
-        payload = {
-            "meta": {
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "host": socket.gethostname(),
-                "torch": getattr(torch, "__version__", "unknown"),
-            },
-            "result": asdict(result),
-            "hydra": OmegaConf.to_container(cfg_dict, resolve=True),  # type: ignore[arg-type]
-        }
-
-        # Write into the Hydra run dir (CWD), and also update the repo-level "latest".
-        Path("results.json").write_text(json.dumps(payload, indent=2) + "\n")
-        (_REPO_ROOT / "train/latest_train.json").write_text(json.dumps(payload, indent=2) + "\n")
-
-        print("Wrote: results.json")
-        print(f"overall_SPS={result.overall_sps:.2f} mean_loss={result.mean_loss:.6f}")
-        if result.eval:
-            print(f"eval={result.eval}")
-        return 0
-
-    return _hydra_main()  # type: ignore[func-returns-value]
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+# =========================================================================== #
+# AlphaStar triad training loop (cfg.triad_enabled == True)
+# =========================================================================== #
