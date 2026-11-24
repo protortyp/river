@@ -307,3 +307,70 @@ def test_pseudo_harmonic_translation_and_nested_river_session():
     )
     assert sess2.solves_run == 2
     assert act2 in (c.ACTION_CALL, c.ACTION_RAISE)
+
+
+def test_turn_equity_matrix_exact_outs_and_continual_turn_to_river_handoff():
+    from gpu_poker.search import RiverSubgameSession, build_turn_equity_matrix
+
+    # Board: 2c 3d 7h 8s (no flush/straight draws for AA vs KK).
+    # KK has 2 outs (Kc, Kd) out of 44 unblocked river cards -> AA equity sign = (42 - 2)/44.
+    board4 = [_card("2", "c"), _card("3", "d"), _card("7", "h"), _card("8", "s")]
+    aa = [_card("A", "h"), _card("A", "s")]
+    kk = [_card("K", "h"), _card("K", "s")]
+    combos = np.array([combo_id(*aa), combo_id(*kk)], dtype=np.int32)
+    c0 = COMBO_C0[combos]
+    c1 = COMBO_C1[combos]
+    s_bar = build_turn_equity_matrix(c0, c1, board4, RiverHandEvaluator())
+    assert abs(float(s_bar[0, 1]) - (40.0 / 44.0)) < 1e-5
+    assert abs(float(s_bar[1, 0]) + (40.0 / 44.0)) < 1e-5
+
+    # Continual Turn -> River handoff masks the river card and solves the river subgame.
+    air = [_card("4", "c"), _card("5", "d")]
+    r0 = np.zeros(NUM_COMBOS, dtype=np.float32)
+    r0[combo_id(*aa)] = 0.5
+    r0[combo_id(*air)] = 0.5
+    r1 = np.zeros(NUM_COMBOS, dtype=np.float32)
+    r1[combo_id(*kk)] = 1.0
+
+    turn_solver = RiverDCFRSolver(bet_fractions=(1.0,), max_raises=1)
+    turn_sess = RiverSubgameSession(
+        solver=turn_solver,
+        board=board4,
+        range_p0=r0,
+        range_p1=r1,
+        big_blind=10,
+        iterations=80,
+        prune_eps=0.0,
+        keep_combo=combo_id(*aa),
+    )
+    t_act, t_amt = turn_sess.act(
+        pot=100,
+        stacks=(200, 200),
+        bets=(0, 0),
+        active_player=0,
+        actions_taken=0,
+        raises_taken=0,
+        last_raise=0,
+        hole_cards=aa,
+        deterministic=True,
+    )
+    assert t_act == c.ACTION_RAISE and t_amt > 0
+    turn_sess.observe_action(c.ACTION_CALL, delta=0)
+
+    # River card Kd hits KK's set! Handoff masks Kd and solves river cleanly.
+    river_card = _card("K", "d")
+    river_sess = turn_sess.handoff_to_river(river_card=river_card, river_solver=turn_solver)
+    assert len(river_sess.board) == 5
+    assert river_sess.ranges[0][combo_id(river_card, _card("Q", "c"))] == 0.0
+    r_act, _r_amt = river_sess.act(
+        pot=300,
+        stacks=(100, 100),
+        bets=(0, 0),
+        active_player=0,
+        actions_taken=0,
+        raises_taken=0,
+        last_raise=0,
+        hole_cards=aa,
+        deterministic=True,
+    )
+    assert r_act in (c.ACTION_CHECK, c.ACTION_RAISE)

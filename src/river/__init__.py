@@ -16,6 +16,7 @@ from gpu_poker.search import (
     RiverDCFRSolver,
     RiverHandEvaluator,
     RiverSubgameSession,
+    build_turn_equity_matrix,
     pseudo_harmonic_bucket_weights,
 )
 
@@ -31,6 +32,7 @@ __all__ = [
     "RiverHandEvaluator",
     "RiverSubgameSession",
     "WarpPokerEnv",
+    "build_turn_equity_matrix",
     "constants",
     "pseudo_harmonic_bucket_weights",
     "raise_bucket_to_amount",
