@@ -87,6 +87,62 @@ def test_river_cfv_net_exact_zero_sum_spr_zero_and_smoke_train(tmp_path):
     assert reloaded.hidden_dim == 32
 
 
+def test_river_cfv_net_exact_card_permutation_equivariance():
+    """Relabeling the 52 cards permutes RiverCFVNet outputs identically across all 1,326 combos."""
+    torch.manual_seed(7)
+    net = RiverCFVNet(hidden_dim=32, num_blocks=2)
+    # Break zero-init on out_head so equivariance is tested on non-trivial weights.
+    with torch.no_grad():
+        net.out_head.weight.normal_(0.0, 0.1)
+        net.out_head.bias.normal_(0.0, 0.05)
+    net.eval()
+
+    board = [_card("A", "s"), _card("K", "s"), _card("7", "d"), _card("3", "c"), _card("2", "s")]
+    pct, valid = river_hand_strength_pct(board, RiverHandEvaluator())
+    rng = np.random.default_rng(123)
+    r0 = rng.random(NUM_COMBOS, dtype=np.float32) * valid
+    r0 /= r0.sum()
+    r1 = rng.random(NUM_COMBOS, dtype=np.float32) * valid
+    r1 /= r1.sum()
+    ck0 = (rng.random(NUM_COMBOS, dtype=np.float32) - 0.5) * valid
+    ck1 = (rng.random(NUM_COMBOS, dtype=np.float32) - 0.5) * valid
+
+    # Build a random permutation of the 52 cards and induced permutation on 1,326 combos.
+    from gpu_poker.search import COMBO_C0, COMBO_C1
+
+    card_perm = rng.permutation(52)
+    combo_perm = np.array(
+        [
+            combo_id(int(card_perm[c0]), int(card_perm[c1]))
+            for c0, c1 in zip(COMBO_C0, COMBO_C1, strict=True)
+        ],
+        dtype=np.int64,
+    )
+    inv_perm = np.argsort(combo_perm)
+
+    with torch.no_grad():
+        p0, p1 = net(
+            r0=torch.from_numpy(r0)[None],
+            r1=torch.from_numpy(r1)[None],
+            check_cfv0=torch.from_numpy(ck0)[None],
+            check_cfv1=torch.from_numpy(ck1)[None],
+            rank_pct=torch.from_numpy(pct)[None],
+            valid_mask=torch.from_numpy(valid)[None],
+            spr=torch.tensor([2.0]),
+        )
+        q0, q1 = net(
+            r0=torch.from_numpy(r0[inv_perm])[None],
+            r1=torch.from_numpy(r1[inv_perm])[None],
+            check_cfv0=torch.from_numpy(ck0[inv_perm])[None],
+            check_cfv1=torch.from_numpy(ck1[inv_perm])[None],
+            rank_pct=torch.from_numpy(pct[inv_perm])[None],
+            valid_mask=torch.from_numpy(valid[inv_perm])[None],
+            spr=torch.tensor([2.0]),
+        )
+    assert torch.allclose(p0[0], q0[0, combo_perm], atol=1e-5)
+    assert torch.allclose(p1[0], q1[0, combo_perm], atol=1e-5)
+
+
 def test_turn_dcfr_with_zero_init_cfv_net_matches_exact_checkdown_and_caps_deep_jams():
     """Zero-init RiverCFVNet equals exact checkdown equity -> Turn DCFR matches identically."""
     board4 = [_card("2", "c"), _card("3", "d"), _card("7", "h"), _card("8", "s")]
