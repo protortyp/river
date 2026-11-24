@@ -44,23 +44,22 @@ PPO update (per epoch):
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
 import torch
 
+from train.buffer import RolloutBuffer
+from train.config import TrainConfig
 from train.league import OpponentMeta, pfsp_weights_from_bb_per_hand
 
 if TYPE_CHECKING:
-    # Avoid runtime circular import. train.train imports this module.
     from gpu_poker.policy import PokerPolicyNet
     from gpu_poker.policy_transformer import PokerTransformerPolicyNet
-    from train.train import RolloutBuffer, TrainConfig
 
-    # Either policy backbone. Both expose the same forward_step / evaluate_step
-    # / lstm_hidden contract (see train._make_policy), so the controller treats
-    # them interchangeably.
     PolicyNet = PokerPolicyNet | PokerTransformerPolicyNet
 
 # Role identifiers used in every per-role mapping. Stable strings (no
@@ -579,11 +578,6 @@ class TriadController:
         make_net: Callable[[], PolicyNet],
         state_dtype: torch.dtype = torch.float32,
     ) -> None:
-        # Deferred import to break circular import (train.train imports
-        # this module). RolloutBuffer is the buffer class we already use
-        # for the single-net path; we instantiate one per role.
-        from train.train import RolloutBuffer
-
         self.cfg = cfg
         self.scalar_dim = int(scalar_dim)
         self.device = device
@@ -666,18 +660,80 @@ class TriadController:
 
     # ------------------------------------------------------- resume / init
 
-    def init_from_resume(self, resume_path: str | None) -> None:
-        """Load weights from a single checkpoint into all three nets (D8).
+    def save_triad_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        env_steps: int,
+        update: int,
+    ) -> Path:
+        """Save per-role weights, optimizers, and snapshot metadata with an index JSON."""
+        ckpt_dir = Path(checkpoint_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        index: dict[str, object] = {
+            "format": "triad_v1",
+            "env_steps": int(env_steps),
+            "update": int(update),
+            "roles": {},
+        }
+        roles_meta: dict[str, dict[str, object]] = {}
+        for role in ROLES:
+            rs = self.roles[role]
+            role_file = ckpt_dir / f"triad_{role}_env{env_steps}_upd{update}.pt"
+            torch.save(
+                {
+                    "model": rs.net.state_dict(),
+                    "optimizer": rs.opt.state_dict(),
+                    "env_steps": int(env_steps),
+                    "update": int(update),
+                    "role": role,
+                },
+                role_file,
+            )
+            roles_meta[role] = {
+                "path": role_file.name,
+                "snapshot_count": int(rs.snapshot_count),
+                "last_snapshot_update": int(rs.last_snapshot_update),
+                "eval_wr_vs_targets": dict(rs.eval_wr_vs_targets),
+                "eval_bb_per_hand_vs_targets": dict(rs.eval_bb_per_hand_vs_targets),
+            }
+        index["roles"] = roles_meta
+        index_path = ckpt_dir / f"triad_env{env_steps}_upd{update}_index.json"
+        index_path.write_text(json.dumps(index, indent=2) + "\n")
+        return index_path
 
-        If ``resume_path`` is empty/None, leaves nets at their fresh
-        random init from ``make_net()``. If it's a single .pt file, all
-        three nets load the same state_dict (they then diverge through
-        per-role gradients). Three-file resume (one .pt per role) is
-        deferred to T9.
-        """
+    def init_from_resume(self, resume_path: str | None) -> None:
+        """Load per-role state from a triad index JSON or fan out a single `.pt` to all roles."""
         if not resume_path:
             return
-        ckpt = torch.load(resume_path, map_location=self.device)
+        p = Path(resume_path)
+        if p.suffix == ".json":
+            payload = json.loads(p.read_text())
+            roles_meta = payload.get("roles", {})
+            for role in ROLES:
+                meta = roles_meta.get(role)
+                if not meta:
+                    continue
+                role_path = Path(meta["path"])
+                if not role_path.is_absolute():
+                    role_path = p.parent / role_path
+                ckpt = torch.load(role_path, map_location=self.device)
+                state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+                rs = self.roles[role]
+                rs.net.load_state_dict(state_dict)
+                if "optimizer" in ckpt:
+                    rs.opt.load_state_dict(ckpt["optimizer"])
+                rs.snapshot_count = int(meta.get("snapshot_count", 0))
+                rs.last_snapshot_update = int(meta.get("last_snapshot_update", -1))
+                rs.eval_wr_vs_targets = {
+                    str(k): float(v) for k, v in meta.get("eval_wr_vs_targets", {}).items()
+                }
+                rs.eval_bb_per_hand_vs_targets = {
+                    str(k): float(v) for k, v in meta.get("eval_bb_per_hand_vs_targets", {}).items()
+                }
+            return
+
+        ckpt = torch.load(p, map_location=self.device)
         state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
         for role in ROLES:
             self.roles[role].net.load_state_dict(state_dict)
@@ -1000,17 +1056,11 @@ class TriadController:
         return applied
 
     def maybe_force_reset_me(self, update: int) -> dict[str, int | str] | None:
-        """If ME has been stuck (no snapshot/reset) longer than the timeout,
-        copy current Main's weights into ME's net.
+        """Reset ME from Main's weights if ME has gone `triad_me_force_reset_every`
+        updates without a snapshot/reset.
 
-        Counters the [[me-exploiter-stalling]] failure mode: once Main
-        catches up to ME, ME's WR collapses below ``triad_me_promote_wr``
-        and the WR-gated snapshot+mutate path never fires again. ME then
-        sits frozen, training but never re-initializing -- burning GPU
-        cycles producing nothing new. Per AlphaStar (Vinyals et al. 2019
-        §3 / Extended Data Fig. 3), main exploiters reinitialize from the
-        main agent every 50-100 PPO updates regardless of WR, to escape
-        local optima.
+        Prevents main-exploiter stalling when Main catches up and ME's win rate
+        drops below `triad_me_promote_wr`, stopping the WR-gated reset path.
 
         Disabled when ``cfg.triad_me_force_reset_every <= 0`` (default).
 

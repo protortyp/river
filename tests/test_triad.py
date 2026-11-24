@@ -1000,3 +1000,98 @@ def test_maybe_force_reset_me_does_not_bump_snapshot_count():
     assert triad.role(ROLE_ME).snapshot_count == 0
     triad.maybe_force_reset_me(update=100)
     assert triad.role(ROLE_ME).snapshot_count == 0
+
+
+def test_triad_three_file_checkpoint_roundtrip(tmp_path):
+    """Per-role checkpoint saves/restores distinct weights and bookkeeping for M/ME/LE."""
+    cfg = _base_cfg()
+    triad_a = _make_triad(cfg)
+    triad_a.role(ROLE_MAIN).snapshot_count = 4
+    triad_a.role(ROLE_MAIN).last_snapshot_update = 100
+    triad_a.role(ROLE_ME).eval_wr_vs_targets["main_current"] = 0.63
+    triad_a.role(ROLE_LE).eval_bb_per_hand_vs_targets["main_current"] = 0.25
+
+    index_path = triad_a.save_triad_checkpoint(tmp_path / "ckpts", env_steps=12345, update=100)
+    assert index_path.exists()
+
+    triad_b = _make_triad(cfg)
+    triad_b.init_from_resume(str(index_path))
+    for role in ROLES:
+        assert _params_equal(
+            triad_a.role(role).net.state_dict(),
+            triad_b.role(role).net.state_dict(),
+        )
+    assert triad_b.role(ROLE_MAIN).snapshot_count == 4
+    assert triad_b.role(ROLE_MAIN).last_snapshot_update == 100
+    assert triad_b.role(ROLE_ME).eval_wr_vs_targets["main_current"] == pytest.approx(0.63)
+    assert triad_b.role(ROLE_LE).eval_bb_per_hand_vs_targets["main_current"] == pytest.approx(0.25)
+
+
+def test_unified_pool_prune_role_enforces_fifo_cap(tmp_path):
+    """prune_role deletes oldest snapshots for the target role while keeping other roles."""
+    from train.league import UnifiedOpponentPool
+
+    pool = UnifiedOpponentPool(pool_dir=tmp_path / "pool", bot_names=[])
+    cfg = _base_cfg()
+    factory = _make_dummy_net_factory(cfg)
+    net = factory()
+
+    m1 = pool.add_snapshot(model=net, env_steps=100, update=1, agent_role=ROLE_TAG_MAIN_HISTORICAL)
+    m2 = pool.add_snapshot(model=net, env_steps=200, update=2, agent_role=ROLE_TAG_MAIN_HISTORICAL)
+    m3 = pool.add_snapshot(model=net, env_steps=300, update=3, agent_role=ROLE_TAG_MAIN_HISTORICAL)
+    le1 = pool.add_snapshot(model=net, env_steps=250, update=2, agent_role=ROLE_TAG_LE_HISTORICAL)
+
+    removed = pool.prune_role(agent_role=ROLE_TAG_MAIN_HISTORICAL, max_keep=2)
+    assert removed == [m1.id]
+    remaining_ids = {m.id for m in pool.get_snapshots()}
+    assert remaining_ids == {m2.id, m3.id, le1.id}
+
+
+def test_triad_runner_eval_updates_pfsp_and_prunes_pool(tmp_path):
+    """Integration check: triad runner prunes snapshots to cap and populates PFSP scores."""
+    from train.league import UnifiedOpponentPool
+    from train.train import run
+
+    cfg = _base_cfg(
+        num_envs=384,
+        rollout_steps=4,
+        total_env_steps=384 * 4 * 3,  # 3 updates
+        minibatch_size=128,
+        checkpoint_dir=str(tmp_path / "triad_ckpt"),
+        triad_main_snapshot_every=1,
+        triad_main_pool_cap=1,
+        triad_eval_every_updates=2,
+        triad_eval_hands=64,
+        eval_max_steps=5000,
+        mlflow_enabled=False,
+    )
+    result = run(cfg)
+    assert result.env_steps >= 384 * 4 * 3
+
+    pool = UnifiedOpponentPool(
+        pool_dir=tmp_path / "triad_ckpt" / "league_pool",
+        bot_names=[],
+    )
+    snaps = [m for m in pool.get_snapshots() if m.agent_role == ROLE_TAG_MAIN_HISTORICAL]
+    assert len(snaps) == 1
+    # Run 3 updates with eval on update 3 (after snapshots from updates 1 & 2 exist).
+    cfg2 = _base_cfg(
+        num_envs=384,
+        rollout_steps=4,
+        total_env_steps=384 * 4 * 3,
+        minibatch_size=128,
+        checkpoint_dir=str(tmp_path / "triad_ckpt2"),
+        triad_main_snapshot_every=1,
+        triad_main_pool_cap=4,
+        triad_eval_every_updates=3,
+        triad_eval_hands=64,
+        eval_max_steps=5000,
+        mlflow_enabled=False,
+    )
+    run(cfg2)
+    pool2 = UnifiedOpponentPool(
+        pool_dir=tmp_path / "triad_ckpt2" / "league_pool",
+        bot_names=[],
+    )
+    snaps2 = pool2.get_snapshots()
+    assert any(s.hands is not None and s.hands > 0 for s in snaps2)

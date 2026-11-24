@@ -196,6 +196,26 @@ class UnifiedOpponentPool:
         # Save back bots + kept snapshots
         self.save_index(bots + kept_snapshots)
 
+    def prune_role(self, *, agent_role: str, max_keep: int) -> list[str]:
+        """Keep at most the `max_keep` newest snapshots for `agent_role`, deleting older ones."""
+        opponents = self.load_index()
+        max_keep = max(0, int(max_keep))
+        role_snaps = [o for o in opponents if o.kind == "snapshot" and o.agent_role == agent_role]
+        if len(role_snaps) <= max_keep:
+            return []
+
+        role_sorted = sorted(role_snaps, key=lambda m: (m.env_steps or 0, m.update or 0))
+        to_remove = role_sorted[: len(role_sorted) - max_keep]
+        remove_ids = {m.id for m in to_remove}
+
+        for m in to_remove:
+            with contextlib.suppress(OSError):
+                Path(m.id).unlink(missing_ok=True)
+
+        kept = [o for o in opponents if o.id not in remove_ids]
+        self.save_index(kept)
+        return [m.id for m in to_remove]
+
 
 def pfsp_weights_from_bb_per_hand(
     bb_per_hand: torch.Tensor,

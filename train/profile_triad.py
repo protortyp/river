@@ -40,7 +40,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch  # noqa: E402
 
-OUT_DIR = Path(os.environ.get("PROFILE_OUT_DIR", "/root/profile_trace"))
+OUT_DIR = Path(os.environ.get("PROFILE_OUT_DIR", str(_REPO_ROOT / "train/outputs/profile_trace")))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -73,12 +73,9 @@ def _on_trace_ready(prof: torch.profiler.profile) -> None:
 
 
 def install_profiler_into_triad() -> torch.profiler.profile:
-    """Monkey-patch ``_run_impl_triad`` to call ``prof.step()`` per update.
-
-    We hook by wrapping the existing tqdm ``pbar.update`` call (which fires
-    exactly once per update at line ~2851 of train.py after the rollout).
-    """
+    """Wrap `_run_impl_triad` to advance `torch.profiler` once per update."""
     import train.train as tmod
+    import train.triad_runner as rmod
 
     prof = torch.profiler.profile(
         activities=[
@@ -92,12 +89,10 @@ def install_profiler_into_triad() -> torch.profiler.profile:
         with_stack=True,
     )
 
-    _orig_run_impl_triad = tmod._run_impl_triad
+    _orig_run_impl_triad = rmod._run_impl_triad
 
     def patched(cfg):  # type: ignore[no-untyped-def]
-        # Patch the global tqdm reference so its ``update()`` advances the
-        # profiler. Done before _run_impl_triad runs.
-        original_tqdm = tmod.tqdm
+        original_tqdm = rmod.tqdm
 
         class _TqdmWithProfStep(original_tqdm):  # type: ignore[misc, valid-type]
             def update(self, n: int = 1):  # noqa: D401
@@ -105,13 +100,14 @@ def install_profiler_into_triad() -> torch.profiler.profile:
                 prof.step()
                 return ret
 
-        tmod.tqdm = _TqdmWithProfStep  # type: ignore[assignment]
+        rmod.tqdm = _TqdmWithProfStep  # type: ignore[assignment]
         try:
             with prof:
                 return _orig_run_impl_triad(cfg)
         finally:
-            tmod.tqdm = original_tqdm  # type: ignore[assignment]
+            rmod.tqdm = original_tqdm  # type: ignore[assignment]
 
+    rmod._run_impl_triad = patched  # type: ignore[assignment]
     tmod._run_impl_triad = patched  # type: ignore[assignment]
     return prof
 

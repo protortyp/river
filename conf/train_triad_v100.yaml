@@ -121,10 +121,8 @@ triad_me_promote_wr: 0.70
 triad_le_promote_wr: 0.70
 triad_le_reset_prob: 0.50
 triad_me_curriculum_threshold: 0.30
-# Force-reset ME from current Main every N updates if WR gate never
-# fires. AlphaStar §3 / Vinyals et al. 2019 reinitialize main exploiters
-# every 50-100 PPO updates regardless of WR -- without this, once Main
-# catches up to ME, ME freezes (wiki/me-exploiter-stalling.md). 0 disables.
+# Force-reset ME from current Main every N updates if WR gate never fires,
+# preventing main-exploiter stalling once Main catches up. 0 disables.
 triad_me_force_reset_every: 50
 
 # Async eval (T7 stub uses inline sigmoid proxy; real evals replace later).
@@ -148,8 +146,8 @@ triad_lr_le: null
 triad_entropy_me: null
 triad_entropy_le: null
 
-# MLflow tracking (server configured via .env). Off-by-config = no-op.
-mlflow_enabled: true
+# MLflow tracking (opt-in; configure MLFLOW_TRACKING_URI in .env).
+mlflow_enabled: false
 mlflow_experiment: null
 mlflow_run_name: null
 # Flat labels surface in the UI as searchable tags (Neptune-style).

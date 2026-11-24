@@ -149,13 +149,13 @@
   let showHints = $state(false);
   onMount(() => {
     if (typeof localStorage !== "undefined") {
-      showHints = localStorage.getItem("pokergpu.showHints") === "1";
+      showHints = localStorage.getItem("river.showHints") === "1";
     }
   });
   function toggleHints() {
     showHints = !showHints;
     if (typeof localStorage !== "undefined") {
-      localStorage.setItem("pokergpu.showHints", showHints ? "1" : "0");
+      localStorage.setItem("river.showHints", showHints ? "1" : "0");
     }
   }
 
@@ -234,21 +234,20 @@
 </script>
 
 <svelte:head>
-  <title>pokergpu — play vs your trained bot</title>
+  <title>River — Heads-Up No-Limit Hold'em</title>
 </svelte:head>
 
 <svelte:window onkeydown={onKeyDown} />
 
 <main>
   <header>
-    <h1>pokergpu</h1>
-    <p class="tag">Drop a <code>.onnx</code> file you exported and play heads-up.</p>
+    <h1>River</h1>
+    <p class="tag">Drop a <code>.onnx</code> model exported from River and play heads-up.</p>
   </header>
 
   {#if !modelLoaded}
     <section
       class="drop"
-      role="region"
       aria-label="Drop ONNX model here"
       ondragover={(e) => e.preventDefault()}
       ondrop={onDrop}
