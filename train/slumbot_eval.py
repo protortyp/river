@@ -44,6 +44,13 @@ from gpu_poker.policy import (  # noqa: E402
     NUM_RAISE_BUCKETS,
     RAISE_BUCKET_FRACTIONS,
 )
+from gpu_poker.search import (  # noqa: E402
+    COMBO_C0,
+    COMBO_C1,
+    BeliefTracker,
+    RiverDCFRSolver,
+    unblocked_combo_indices,
+)
 
 SLUMBOT_API = "https://slumbot.com/api"
 SLUMBOT_SB = 50
@@ -553,14 +560,139 @@ class OnnxPolicy:
             raise_bucket = sample(raise_logits)
         return action_type, raise_bucket
 
+    def action_likelihoods_for_combos(
+        self,
+        *,
+        combo_indices: np.ndarray,
+        board: list[int],
+        scalars_1d: np.ndarray,
+        action_mask_1d: np.ndarray,
+        history: list[tuple[int, int, int, int]],
+        taken_action: int,
+        taken_bucket: int,
+    ) -> np.ndarray:
+        """Compute `P(taken_action, taken_bucket | combo)` for all combos in one ONNX batch."""
+        n = len(combo_indices)
+        cards = np.full((n, 7), -1, dtype=np.int64)
+        cards[:, 0] = COMBO_C0[combo_indices]
+        cards[:, 1] = COMBO_C1[combo_indices]
+        for i, bc in enumerate(board[:5]):
+            cards[:, 2 + i] = int(bc)
+
+        scalars = np.broadcast_to(scalars_1d.reshape(1, 17), (n, 17)).copy()
+        mask = np.broadcast_to(action_mask_1d.reshape(1, 4), (n, 4)).copy()
+
+        h_one = np.zeros((1, 1, self.state_width), dtype=np.float32)
+        if self.is_transformer:
+            m = min(len(history), TRANSFORMER_MAX_TOKENS)
+            for i in range(m):
+                pid, act, bkt, stg = history[i]
+                base = i * 4
+                h_one[0, 0, base + 0] = float(max(0, min(2, pid + 1)))
+                h_one[0, 0, base + 1] = float(max(0, min(const.NUM_ACTIONS, act + 1)))
+                h_one[0, 0, base + 2] = float(
+                    max(0, min(NUM_RAISE_BUCKETS, (bkt if act == const.ACTION_RAISE else 0) + 1))
+                )
+                h_one[0, 0, base + 3] = float(max(0, min(const.NUM_STAGES, stg + 1)))
+            h_one[0, 0, TRANSFORMER_MAX_TOKENS * 4] = float(m)
+        h = np.broadcast_to(h_one, (1, n, self.state_width)).copy()
+        c_ = np.zeros((1, n, self.state_width), dtype=np.float32)
+
+        out = self.session.run(
+            None,
+            {"cards": cards, "scalars": scalars, "action_mask": mask, "h": h, "c": c_},
+        )
+        act_logits = np.asarray(out[0], dtype=np.float64)
+        act_logits = np.where(np.isfinite(act_logits), act_logits, -1e9)
+        act_shift = act_logits - act_logits.max(axis=1, keepdims=True)
+        act_exp = np.exp(act_shift)
+        act_probs = act_exp / np.maximum(act_exp.sum(axis=1, keepdims=True), 1e-12)
+        p_act = act_probs[:, int(taken_action)]
+
+        if int(taken_action) == const.ACTION_RAISE:
+            rb_logits = np.asarray(out[1], dtype=np.float64)
+            rb_shift = rb_logits - rb_logits.max(axis=1, keepdims=True)
+            rb_exp = np.exp(rb_shift)
+            rb_probs = rb_exp / np.maximum(rb_exp.sum(axis=1, keepdims=True), 1e-12)
+            p_act = p_act * rb_probs[:, int(taken_bucket)]
+        return p_act.astype(np.float32)
+
+
+def compute_river_beliefs(
+    *,
+    policy: OnnxPolicy,
+    button: int,
+    action_str: str,
+    board_per_street: list[list[int]],
+) -> BeliefTracker:
+    """Replay public history through `policy` to compute Bayesian ranges for both seats."""
+    bt = BeliefTracker(smoothing=5e-4)
+    st = HUNLState(button=button, hero_seat=0, hole_cards_hero=[0, 1])
+    tokens = parse_action_tokens(action_str)
+    current_street = 0
+    history: list[tuple[int, int, int, int]] = []
+    cur_board: list[int] = []
+
+    for street_idx, tok in tokens:
+        while current_street < street_idx:
+            current_street += 1
+            if current_street < len(board_per_street):
+                cur_board = board_per_street[current_street]
+                st.reveal_board(cur_board)
+                bt.mask_board(cur_board)
+
+        p = st.active_player
+        stage = st.stage
+        obs_pub = encode_obs(st)
+        active_combos = unblocked_combo_indices(cur_board)
+
+        if tok == "f":
+            act, bkt, delta = const.ACTION_FOLD, 0, 0
+        elif tok == "k":
+            act, bkt, delta = const.ACTION_CHECK, 0, 0
+        elif tok == "c":
+            tc = st.to_call(p)
+            act = const.ACTION_CHECK if tc == 0 else const.ACTION_CALL
+            bkt, delta = 0, 0
+        elif tok.startswith("b") or tok.startswith("r"):
+            target_total = int(tok[1:])
+            tc = st.to_call(p)
+            delta = max(0, target_total - st.bets[p] - tc)
+            _, min_r, max_r = st.legal_actions()
+            pot_total = st.pot + st.bets[0] + st.bets[1]
+            bkt = amount_to_nearest_bucket(
+                delta, pot_total=pot_total, min_raise=min_r, max_raise=max_r
+            )
+            act = const.ACTION_RAISE
+        else:
+            continue
+
+        lik = policy.action_likelihoods_for_combos(
+            combo_indices=active_combos,
+            board=cur_board,
+            scalars_1d=obs_pub["scalars"],
+            action_mask_1d=obs_pub["action_mask"],
+            history=history,
+            taken_action=act,
+            taken_bucket=bkt,
+        )
+        bt.update_action(p, lik, active_indices=active_combos)
+        history.append((p, act, bkt, stage))
+        st.apply(act, amount=delta)
+
+    # Mask any final board cards revealed after the last action.
+    if len(board_per_street) > 3 and board_per_street[3]:
+        bt.mask_board(board_per_street[3])
+    return bt
+
 
 # ---------------------------------------------------------------------------
 # Slumbot API client.
 # ---------------------------------------------------------------------------
 
 
-def slumbot_new_hand(session: requests.Session) -> dict[str, Any]:
-    r = session.post(f"{SLUMBOT_API}/new_hand", json={"token": ""}, timeout=15)
+def slumbot_new_hand(session: requests.Session, token: str = "") -> dict[str, Any]:
+    r = session.post(f"{SLUMBOT_API}/new_hand", json={"token": token}, timeout=15)
     r.raise_for_status()
     return r.json()
 
@@ -591,8 +723,18 @@ def _board_per_street(board_strs: list[str]) -> list[list[int]]:
 # ---------------------------------------------------------------------------
 
 
-def run(model_path: str, n_hands: int, deterministic: bool = True, verbose: bool = False) -> None:
+def run(
+    model_path: str,
+    n_hands: int,
+    deterministic: bool = True,
+    verbose: bool = False,
+    river_search: bool = False,
+    search_iters: int = 200,
+) -> None:
     policy = OnnxPolicy(model_path, deterministic=deterministic)
+    solver = (
+        RiverDCFRSolver(bet_fractions=(0.33, 0.75, 1.5), max_raises=3) if river_search else None
+    )
     s = requests.Session()
 
     chip_total = 0
@@ -600,10 +742,14 @@ def run(model_path: str, n_hands: int, deterministic: bool = True, verbose: bool
     deltas: list[int] = []
     t0 = time.perf_counter()
     token = ""
+    river_solves = 0
 
     for hand_i in range(n_hands):
-        data = slumbot_new_hand(s)
-        token = data.get("token", "")
+        data = slumbot_new_hand(s, token)
+        if "error_msg" in data or "hole_cards" not in data:
+            token = ""
+            data = slumbot_new_hand(s, "")
+        token = data.get("token", token)
         # Slumbot's `client_pos` indicates which seat the client is in. Empirically
         # (from observed action histories starting with a villain action when
         # client_pos=0): client_pos=0 means hero is BB; client_pos=1 means hero
@@ -648,31 +794,67 @@ def run(model_path: str, n_hands: int, deterministic: bool = True, verbose: bool
                 break
 
             obs = encode_obs(state)
-            action_type, raise_bucket = policy.act(obs)
-            # If the model picked an illegal action (e.g., due to logit mask quirks),
-            # fall back to fold/check/call.
-            mask, min_d, max_d = state.legal_actions()
-            if not mask[action_type]:
-                if mask[const.ACTION_CHECK]:
-                    action_type = const.ACTION_CHECK
-                elif mask[const.ACTION_CALL]:
-                    action_type = const.ACTION_CALL
-                else:
-                    action_type = const.ACTION_FOLD
-
+            used_search = False
             amount = 0
-            if action_type == const.ACTION_RAISE:
-                amount = bucket_to_amount(
-                    raise_bucket,
-                    pot_total=int(obs["pot_total"]),
-                    min_raise=int(obs["min_raise"]),
-                    max_raise=int(obs["max_raise"]),
-                )
-                if verbose:
-                    print(
-                        f"  raise: bucket={raise_bucket} -> delta={amount} "
-                        f"(pot={int(obs['pot_total'])}, min={min_d}, max={max_d})"
+            if solver is not None and state.stage == const.STAGE_RIVER and len(board) == 5:
+                try:
+                    bps = _board_per_street(board)
+                    bt = compute_river_beliefs(
+                        policy=policy,
+                        button=button,
+                        action_str=action_str,
+                        board_per_street=bps,
                     )
+                    res = solver.solve(
+                        board=bps[3],
+                        pot=state.pot,
+                        stacks=(state.stacks[0], state.stacks[1]),
+                        bets=(state.bets[0], state.bets[1]),
+                        active_player=state.active_player,
+                        range_p0=bt.ranges[0],
+                        range_p1=bt.ranges[1],
+                        actions_taken=state.actions_this_street,
+                        raises_taken=state.num_raises,
+                        last_raise=state.last_raise,
+                        big_blind=state.bb_chips,
+                        iterations=search_iters,
+                    )
+                    probs = res.action_probs_for_hand(state.hole_cards_hero)
+                    probs = probs / max(1e-12, float(probs.sum()))
+                    if deterministic:
+                        chosen_idx = int(np.argmax(probs))
+                    else:
+                        chosen_idx = int(np.random.choice(len(probs), p=probs))
+                    action_type, amount = res.actions[chosen_idx]
+                    used_search = True
+                    river_solves += 1
+                except Exception as e:
+                    if verbose:
+                        print(f"  [river_search fallback]: {e}")
+
+            if not used_search:
+                action_type, raise_bucket = policy.act(obs)
+                mask, min_d, max_d = state.legal_actions()
+                if not mask[action_type]:
+                    if mask[const.ACTION_CHECK]:
+                        action_type = const.ACTION_CHECK
+                    elif mask[const.ACTION_CALL]:
+                        action_type = const.ACTION_CALL
+                    else:
+                        action_type = const.ACTION_FOLD
+
+                if action_type == const.ACTION_RAISE:
+                    amount = bucket_to_amount(
+                        raise_bucket,
+                        pot_total=int(obs["pot_total"]),
+                        min_raise=int(obs["min_raise"]),
+                        max_raise=int(obs["max_raise"]),
+                    )
+                    if verbose:
+                        print(
+                            f"  raise: bucket={raise_bucket} -> delta={amount} "
+                            f"(pot={int(obs['pot_total'])}, min={min_d}, max={max_d})"
+                        )
 
             incr = format_action_for_slumbot(state, action_type, amount)
             if verbose:
@@ -739,6 +921,8 @@ def run(model_path: str, n_hands: int, deterministic: bool = True, verbose: bool
     ci_lo = bb_per_100 - 1.96 * se
     ci_hi = bb_per_100 + 1.96 * se
     print(f"bb/100:          {bb_per_100:+.3f} ± {se:.3f}  (95% CI: {ci_lo:+.2f} .. {ci_hi:+.2f})")
+    if river_search:
+        print(f"river DCFR solves: {river_solves}")
 
 
 def main() -> int:
@@ -746,6 +930,12 @@ def main() -> int:
     p.add_argument("--model", required=True, type=str, help="Path to exported .onnx file.")
     p.add_argument("--hands", type=int, default=1000)
     p.add_argument("--stochastic", action="store_true", help="Sample instead of argmax.")
+    p.add_argument(
+        "--river-search",
+        action="store_true",
+        help="Solve river spots online with Bayesian belief tracking + DCFR subgame solving.",
+    )
+    p.add_argument("--search-iters", type=int, default=200, help="DCFR iterations per river solve.")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
     run(
@@ -753,6 +943,8 @@ def main() -> int:
         n_hands=int(args.hands),
         deterministic=not args.stochastic,
         verbose=args.verbose,
+        river_search=bool(args.river_search),
+        search_iters=int(args.search_iters),
     )
     return 0
 

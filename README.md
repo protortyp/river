@@ -63,8 +63,8 @@ uv run python train/exploitability.py --checkpoint checkpoints/rnad/rnad_final.p
 # Export a trained checkpoint to ONNX (LSTM or Transformer, verified against PyTorch)
 uv run python train/export_onnx.py --checkpoint path/to/ckpt.pt --out model.onnx
 
-# Benchmark against Slumbot (50/100, 200 BB)
-uv run python train/slumbot_eval.py --model model.onnx --hands 1000
+# Benchmark against Slumbot (50/100, 200 BB; add --river-search for online DCFR river solving)
+uv run python train/slumbot_eval.py --model model.onnx --hands 1000 --stochastic --river-search
 
 # Play in the terminal against the latest snapshot
 uv run python play/interactive.py
