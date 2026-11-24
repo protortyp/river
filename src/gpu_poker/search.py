@@ -941,6 +941,106 @@ class RiverDCFRSolver:
             )
         return total
 
+    def _expected_value(
+        self,
+        node: _RiverNode,
+        opp_r: np.ndarray,
+        *,
+        player: int,
+        s_mat: np.ndarray,
+        c0: np.ndarray,
+        c1: np.ndarray,
+    ) -> np.ndarray:
+        """Exact expected CFV `[H]` for `player` under the solved average strategy."""
+        if node.kind == "showdown":
+            t_chips = node.c0 if player == 0 else node.c1
+            return (t_chips * (s_mat @ opp_r)).astype(np.float32)
+
+        if node.kind == "fold":
+            disjoint_mass = _disjoint_mass(opp_r, c0, c1)
+            if node.player == player:
+                loss = node.c0 if player == 0 else node.c1
+                return (-loss * disjoint_mass).astype(np.float32)
+            gain = node.c1 if player == 0 else node.c0
+            return (gain * disjoint_mass).astype(np.float32)
+
+        assert node.strategy_sum is not None
+        avg_strat = _average_strategy(node.strategy_sum)
+        if node.player == player:
+            total = np.zeros(opp_r.shape[0], dtype=np.float32)
+            for a_idx, ch in enumerate(node.children):
+                ch_val = self._expected_value(ch, opp_r, player=player, s_mat=s_mat, c0=c0, c1=c1)
+                total += avg_strat[a_idx] * ch_val
+            return total
+
+        total = np.zeros(opp_r.shape[0], dtype=np.float32)
+        for a_idx, ch in enumerate(node.children):
+            total += self._expected_value(
+                ch, opp_r * avg_strat[a_idx], player=player, s_mat=s_mat, c0=c0, c1=c1
+            )
+        return total
+
+    def solve_cfvs(
+        self,
+        *,
+        board: list[int] | np.ndarray,
+        pot: int,
+        eff_stack: int,
+        range_p0: np.ndarray,
+        range_p1: np.ndarray,
+        big_blind: int = 100,
+        iterations: int = 150,
+        prune_eps: float = 0.0,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Solve a river-entry subgame and return pot-normalized `(cfv0, cfv1, check0, check1)`.
+
+        All four arrays have shape `[1326]` (zero on blocked combos), normalized by `pot` so
+        targets are scale-invariant in `SPR = eff_stack / pot` and satisfy exact zero-sum
+        `dot(r0, cfv0) + dot(r1, cfv1) == 0`.
+        """
+        res = self.solve(
+            board=board,
+            pot=pot,
+            stacks=(int(eff_stack), int(eff_stack)),
+            bets=(0, 0),
+            active_player=0,
+            range_p0=range_p0,
+            range_p1=range_p1,
+            actions_taken=0,
+            raises_taken=0,
+            last_raise=0,
+            big_blind=big_blind,
+            iterations=iterations,
+            prune_eps=prune_eps,
+        )
+        assert res.root_node is not None
+        idx = res.combo_indices
+        c0 = COMBO_C0[idx]
+        c1 = COMBO_C1[idx]
+        r0 = np.asarray(range_p0, dtype=np.float32)[idx].copy()
+        r1 = np.asarray(range_p1, dtype=np.float32)[idx].copy()
+        r0 /= max(1e-12, float(r0.sum()))
+        r1 /= max(1e-12, float(r1.sum()))
+
+        ranks = self.evaluator.eval_river_combos(np.stack([c0, c1], axis=1), board)
+        s_mat = _build_showdown_matrix(c0, c1, ranks)
+        inv_pot = 1.0 / max(1.0, float(pot))
+
+        v0 = self._expected_value(res.root_node, r1, player=0, s_mat=s_mat, c0=c0, c1=c1) * inv_pot
+        v1 = self._expected_value(res.root_node, r0, player=1, s_mat=s_mat, c0=c0, c1=c1) * inv_pot
+        ck0 = 0.5 * (s_mat @ r1).astype(np.float32)
+        ck1 = 0.5 * (s_mat @ r0).astype(np.float32)
+
+        cfv0_full = np.zeros(NUM_COMBOS, dtype=np.float32)
+        cfv1_full = np.zeros(NUM_COMBOS, dtype=np.float32)
+        ck0_full = np.zeros(NUM_COMBOS, dtype=np.float32)
+        ck1_full = np.zeros(NUM_COMBOS, dtype=np.float32)
+        cfv0_full[idx] = v0
+        cfv1_full[idx] = v1
+        ck0_full[idx] = ck0
+        ck1_full[idx] = ck1
+        return cfv0_full, cfv1_full, ck0_full, ck1_full
+
     def _compute_exploitability(
         self,
         root: _RiverNode,
