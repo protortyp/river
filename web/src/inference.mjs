@@ -74,6 +74,21 @@ export function bucketToAmount({ bucket, potTotal, minRaise, maxRaise }) {
   return Math.max(lo, Math.min(hi, amt));
 }
 
+/** Map an arbitrary chip raise delta to the closest discrete raise bucket index. */
+export function amountToNearestBucket({ delta, potTotal, minRaise, maxRaise }) {
+  let bestIdx = 0;
+  let bestErr = Infinity;
+  for (let idx = 0; idx < NUM_RAISE_BUCKETS; idx++) {
+    const target = bucketToAmount({ bucket: idx, potTotal, minRaise, maxRaise });
+    const err = Math.abs(delta - target);
+    if (err < bestErr) {
+      bestErr = err;
+      bestIdx = idx;
+    }
+  }
+  return bestIdx;
+}
+
 export class PokerBot {
   constructor() {
     this.session = null;
@@ -148,6 +163,17 @@ export class PokerBot {
   resetHidden() {
     this.h = new Float32Array(1 * 1 * this.stateWidth);
     this.c = new Float32Array(1 * 1 * this.stateWidth);
+  }
+
+  /** Record an external (human) action into the Transformer public-action history. */
+  recordAction({ playerId, actionType, raiseBucket = 0, stage }) {
+    if (this.backbone !== "transformer" || !this.h) return;
+    this.h = pushActionToken(this.h, {
+      playerId,
+      actionType,
+      raiseBucket: actionType === 3 ? raiseBucket : 0,
+      stage,
+    });
   }
 
   /**

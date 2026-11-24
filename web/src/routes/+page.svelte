@@ -98,9 +98,13 @@
       // Yield to render the spinner.
       await new Promise((r) => setTimeout(r, 30));
       const decision = await bot.act(stateForEncoder(state));
+      const la = legalActions(state);
+      let actionType = decision.actionType;
+      if (actionType === ACTION_FOLD && la.action_mask[ACTION_CHECK]) {
+        actionType = ACTION_CHECK;
+      }
       let amount = 0;
-      if (decision.actionType === ACTION_RAISE) {
-        const la = legalActions(state);
+      if (actionType === ACTION_RAISE) {
         const { bucketToAmount } = await import("../inference.mjs");
         const potTotal = state.pot + state.bets[0] + state.bets[1];
         amount = bucketToAmount({
@@ -110,16 +114,36 @@
           maxRaise: la.max_raise,
         });
       }
-      const note = describeAction(state, decision.actionType, amount, "bot");
+      const note = describeAction(state, actionType, amount, "bot");
       history = [...history, note];
-      applyAction(state, decision.actionType, amount);
+      applyAction(state, actionType, amount);
       botThinking = false;
       if (isHandComplete(state)) endHandAndTally();
     }
   }
 
-  function humanAct(action, amount = 0) {
+  async function humanAct(action, amount = 0) {
     if (!state || isHandComplete(state) || state.active_player !== humanSeat) return;
+    if (bot && bot.backbone === "transformer") {
+      let raiseBucket = 0;
+      if (action === ACTION_RAISE) {
+        const la = legalActions(state);
+        const { amountToNearestBucket } = await import("../inference.mjs");
+        const potTotal = state.pot + state.bets[0] + state.bets[1];
+        raiseBucket = amountToNearestBucket({
+          delta: amount,
+          potTotal,
+          minRaise: la.min_raise,
+          maxRaise: la.max_raise,
+        });
+      }
+      bot.recordAction({
+        playerId: humanSeat,
+        actionType: action,
+        raiseBucket,
+        stage: state.stage,
+      });
+    }
     const note = describeAction(state, action, amount, "you");
     history = [...history, note];
     applyAction(state, action, amount);
