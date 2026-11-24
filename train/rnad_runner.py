@@ -306,22 +306,32 @@ def _run_impl_rnad(cfg: TrainConfig) -> TrainResult:
 
         logprob_reg_f = torch.empty_like(old_logprob_f)
         chunk = max(1024, int(cfg.minibatch_size))
+
+        # Sort flat buffer indices by history length (with random tie-breaking) so each
+        # transformer minibatch trims to a short active sequence instead of padding to 32.
+        if is_transformer:
+            hist_lens_f = h_f[:, -1]
+            sort_keys = hist_lens_f + torch.rand_like(hist_lens_f) * 0.5
+            bucket_order = torch.argsort(sort_keys)
+        else:
+            bucket_order = torch.randperm(total, device=device)
+
         with torch.no_grad():
             for start in range(0, total, chunk):
                 end = min(total, start + chunk)
-                sl = slice(start, end)
+                idx = bucket_order[start:end]
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
                     out_reg = net_reg.evaluate_step(
-                        cards=cards_f[sl],
-                        scalars=scalars_f[sl],
-                        action_mask=mask_f[sl],
-                        action_type=action_type_f[sl],
-                        raise_bucket=raise_bucket_f[sl],
-                        h=h_f[sl].unsqueeze(0),
-                        c=c_f[sl].unsqueeze(0),
+                        cards=cards_f[idx],
+                        scalars=scalars_f[idx],
+                        action_mask=mask_f[idx],
+                        action_type=action_type_f[idx],
+                        raise_bucket=raise_bucket_f[idx],
+                        h=h_f[idx].unsqueeze(0),
+                        c=c_f[idx].unsqueeze(0),
                         terminated=None,
                     )
-                logprob_reg_f[sl] = out_reg.logprob.to(dtype=torch.float32)
+                logprob_reg_f[idx] = out_reg.logprob.to(dtype=torch.float32)
 
             # Bootstrap value at post-rollout state using omniscient critic when enabled.
             pid_now = obs["player_id"].to(dtype=torch.int64)
@@ -389,50 +399,51 @@ def _run_impl_rnad(cfg: TrainConfig) -> TrainResult:
         mb_count = 0
 
         for _epoch in range(int(cfg.num_epochs)):
-            offset_mb = (_epoch * 104729) % max(1, num_mbs)
-            for mb_i in range(num_mbs):
-                j = (mb_i + offset_mb) % num_mbs
-                start = j * mb_size
+            mb_perm = torch.randperm(num_mbs, device=device).tolist()
+            for j in mb_perm:
+                start = int(j) * mb_size
                 end = min(total, start + mb_size)
                 if end <= start:
                     continue
-                sl = slice(start, end)
+                idx = bucket_order[start:end]
 
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
                     if use_omni and isinstance(net, PokerTransformerPolicyNet):
                         eval_out = net.evaluate_step(
-                            cards=cards_f[sl],
-                            scalars=scalars_f[sl],
-                            action_mask=mask_f[sl],
-                            action_type=action_type_f[sl],
-                            raise_bucket=raise_bucket_f[sl],
-                            h=h_f[sl].unsqueeze(0),
-                            c=c_f[sl].unsqueeze(0),
+                            cards=cards_f[idx],
+                            scalars=scalars_f[idx],
+                            action_mask=mask_f[idx],
+                            action_type=action_type_f[idx],
+                            raise_bucket=raise_bucket_f[idx],
+                            h=h_f[idx].unsqueeze(0),
+                            c=c_f[idx].unsqueeze(0),
                             terminated=None,
-                            opp_cards=opp_cards_f[sl],
+                            opp_cards=opp_cards_f[idx],
                         )
                     else:
                         eval_out = net.evaluate_step(
-                            cards=cards_f[sl],
-                            scalars=scalars_f[sl],
-                            action_mask=mask_f[sl],
-                            action_type=action_type_f[sl],
-                            raise_bucket=raise_bucket_f[sl],
-                            h=h_f[sl].unsqueeze(0),
-                            c=c_f[sl].unsqueeze(0),
+                            cards=cards_f[idx],
+                            scalars=scalars_f[idx],
+                            action_mask=mask_f[idx],
+                            action_type=action_type_f[idx],
+                            raise_bucket=raise_bucket_f[idx],
+                            h=h_f[idx].unsqueeze(0),
+                            c=c_f[idx].unsqueeze(0),
                             terminated=None,
                         )
 
-                    log_ratio = (eval_out.logprob - old_logprob_f[sl]).clamp(min=-20.0, max=20.0)
+                    log_ratio = (eval_out.logprob - old_logprob_f[idx]).clamp(min=-20.0, max=20.0)
                     ratio = torch.exp(log_ratio)
-                    unclipped = ratio * adv_f[sl]
-                    clipped = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * adv_f[sl]
+                    unclipped = ratio * adv_f[idx]
+                    clipped = (
+                        torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * adv_f[idx]
+                    )
                     policy_loss = -torch.minimum(unclipped, clipped).mean()
-                    value_loss = 0.5 * (eval_out.value - returns_f[sl]).pow(2).mean()
+                    value_loss = 0.5 * (eval_out.value - returns_f[idx]).pow(2).mean()
                     # Also keep the decentralized value head calibrated for ONNX inference.
                     if eval_out.decentralized_value is not None:
                         dec_v_loss = (
-                            0.5 * (eval_out.decentralized_value - returns_f[sl]).pow(2).mean()
+                            0.5 * (eval_out.decentralized_value - returns_f[idx]).pow(2).mean()
                         )
                         value_loss = value_loss + 0.1 * dec_v_loss
                     entropy_bonus = eval_out.entropy.mean()
@@ -443,7 +454,7 @@ def _run_impl_rnad(cfg: TrainConfig) -> TrainResult:
                     )
 
                 with torch.no_grad():
-                    y = returns_f[sl]
+                    y = returns_f[idx]
                     var_y = y.var(unbiased=False)
                     var_res = (y - eval_out.value.detach()).var(unbiased=False)
                     ev = torch.where(var_y > 1e-8, 1.0 - var_res / var_y, torch.zeros_like(var_y))

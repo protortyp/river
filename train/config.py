@@ -114,8 +114,8 @@ class TrainConfig:
 
     # R-NaD (Regularized Nash Dynamics) & CTDE omniscient critic
     rnad_enabled: bool = False
-    rnad_eta: float = 0.2
-    rnad_reg_update_every: int = 50
+    rnad_eta: float = 0.015
+    rnad_reg_update_every: int = 40
     rnad_kl_clip: float = 10.0
     use_omniscient_critic: bool = True
 

@@ -4,13 +4,13 @@ GPU-first Heads-Up No-Limit Hold'em (HUNL) environment in [NVIDIA Warp](https://
 
 ## Throughput
 
-Measured on a single NVIDIA RTX 3090 (`131,072` parallel environments, `uv run python bench/run.py`):
+Measured on a single GPU (`131,072` parallel environments, `uv run python bench/run.py`):
 
-| Benchmark | Env Steps / sec |
-|---|---:|
-| Warp step kernel (no obs/legal) | **536.6M SPS** |
-| Warp kernels (step + obs + legal, constant / random) | **325.6M / 192.3M SPS** |
-| `WarpPokerEnv.step()` via PyTorch (constant / random) | **280.7M / 185.4M SPS** |
+| Benchmark | RTX 4090 | RTX 3090 |
+|---|---:|---:|
+| Warp step kernel (no obs/legal) | **1.38B SPS** | **536.6M SPS** |
+| Warp kernels (step + obs + legal, constant / random) | **854.2M / 440.1M SPS** | **325.6M / 192.3M SPS** |
+| `WarpPokerEnv.step()` via PyTorch (constant / random) | **516.9M / 431.2M SPS** | **280.7M / 185.4M SPS** |
 
 ## Install
 
