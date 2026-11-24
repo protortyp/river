@@ -366,7 +366,7 @@ class _RiverNode:
 
 def _build_river_tree(
     *,
-    root_pot: float,
+    street_pot: float,
     stacks: tuple[int, int],
     bets: tuple[int, int],
     active_player: int,
@@ -379,13 +379,20 @@ def _build_river_tree(
     inv: tuple[int, int],
     all_in_max_spr: float | None = None,
 ) -> _RiverNode:
-    """Recursively construct the exact street betting tree from the current state."""
+    """Recursively construct the exact street betting tree from the current state.
+
+    `street_pot` is the symmetric pot BEFORE any bets on the current street (`0.5 * street_pot`
+    committed by each seat), and `inv` is each player's total chips committed on the current
+    street (including `bets` already on the felt at the root). This keeps every fold and
+    showdown leaf strictly zero-sum (`c0 == c1` at every showdown) even when solving mid-street
+    facing an opponent bet.
+    """
     p = active_player
     opp = 1 - p
     to_call = max(0, bets[opp] - bets[p])
-    pot_total = int(round(root_pot)) + inv[0] + inv[1]
-    base_c0 = 0.5 * root_pot + inv[0]
-    base_c1 = 0.5 * root_pot + inv[1]
+    pot_total = int(round(street_pot)) + inv[0] + inv[1]
+    base_c0 = 0.5 * street_pot + inv[0]
+    base_c1 = 0.5 * street_pot + inv[1]
 
     node = _RiverNode(kind="decision", player=p, c0=base_c0, c1=base_c1)
 
@@ -402,8 +409,8 @@ def _build_river_tree(
         street_matched = min(new_b0, new_b1)
         uncalled0 = new_b0 - street_matched
         uncalled1 = new_b1 - street_matched
-        sd_c0 = 0.5 * root_pot + (new_inv[0] - uncalled0)
-        sd_c1 = 0.5 * root_pot + (new_inv[1] - uncalled1)
+        sd_c0 = 0.5 * street_pot + (new_inv[0] - uncalled0)
+        sd_c1 = 0.5 * street_pot + (new_inv[1] - uncalled1)
         rem_s0 = stacks[0] - (call_amt if p == 0 else 0) + uncalled0
         rem_s1 = stacks[1] - (call_amt if p == 1 else 0) + uncalled1
         node.actions.append((c.ACTION_CALL, 0))
@@ -432,7 +439,7 @@ def _build_river_tree(
         else:
             node.children.append(
                 _build_river_tree(
-                    root_pot=root_pot,
+                    street_pot=street_pot,
                     stacks=stacks,
                     bets=bets,
                     active_player=opp,
@@ -475,7 +482,7 @@ def _build_river_tree(
             node.actions.append((c.ACTION_RAISE, delta))
             node.children.append(
                 _build_river_tree(
-                    root_pot=root_pot,
+                    street_pot=street_pot,
                     stacks=new_stacks,
                     bets=new_bets,
                     active_player=opp,
@@ -739,11 +746,11 @@ class RiverDCFRSolver:
         else:
             raise ValueError(f"Expected 4 (turn) or 5 (river) board cards, got {len(board_list)}")
 
-        # Folded/committed root pot accounts for pot + already-matched street bets.
+        street_pot = float(pot)
         root_pot = float(pot + bets[0] + bets[1])
         is_turn = len(board_list) == 4
         root = _build_river_tree(
-            root_pot=root_pot,
+            street_pot=street_pot,
             stacks=(int(stacks[0]), int(stacks[1])),
             bets=(int(bets[0]), int(bets[1])),
             active_player=int(active_player),
@@ -753,7 +760,7 @@ class RiverDCFRSolver:
             big_blind=int(big_blind),
             bet_fractions=self.bet_fractions,
             max_raises=self.max_raises,
-            inv=(0, 0),
+            inv=(int(bets[0]), int(bets[1])),
             all_in_max_spr=self.turn_all_in_max_spr if is_turn else None,
         )
 
@@ -1328,10 +1335,11 @@ class RiverSubgameSession:
         strat = _average_strategy(node.strategy_sum)
         lik = strat[action_idx] + 1e-4
         p = int(node.player)
-        self.ranges[p][self.combo_indices] *= lik
-        s = float(self.ranges[p].sum())
+        updated = np.zeros_like(self.ranges[p])
+        updated[self.combo_indices] = self.ranges[p][self.combo_indices] * lik
+        s = float(updated.sum())
         if s > 1e-12:
-            self.ranges[p] /= s
+            self.ranges[p] = updated / s
 
     def observe_action(self, action_type: int, delta: int = 0) -> None:
         """Advance the cached river tree by one observed action (hero or opponent).

@@ -374,3 +374,72 @@ def test_turn_equity_matrix_exact_outs_and_continual_turn_to_river_handoff():
         deterministic=True,
     )
     assert r_act in (c.ACTION_CHECK, c.ACTION_RAISE)
+
+
+def test_midstreet_facing_overbet_exact_pot_odds_and_zero_sum():
+    """Mid-street solve facing a 5x-pot bet must keep c0 == c1 and enforce exact 45.45% odds."""
+    board = [_card("2", "c"), _card("3", "d"), _card("7", "h"), _card("8", "s"), _card("J", "c")]
+    nuts = [_card("A", "h"), _card("A", "s")]
+    air = [_card("4", "c"), _card("5", "d")]
+    catcher = [_card("Q", "h"), _card("Q", "s")]
+
+    # pot=1000 before street, Villain (P1) bet 5000 (5x pot) all-in -> Hero (P0) faces 5000 to win
+    # 6000 (total final pot 11000), so break-even equity to call is 5000 / 11000 = 45.45%.
+    r0 = np.zeros(NUM_COMBOS, dtype=np.float32)
+    r0[combo_id(*catcher)] = 1.0
+
+    # Case 1: Villain has 60% nuts / 40% air -> Hero has 40% equity (< 45.45%) -> must 100% FOLD.
+    r1_value_heavy = np.zeros(NUM_COMBOS, dtype=np.float32)
+    r1_value_heavy[combo_id(*nuts)] = 0.60
+    r1_value_heavy[combo_id(*air)] = 0.40
+
+    solver = RiverDCFRSolver(bet_fractions=(1.0,), max_raises=1)
+    res_fold = solver.solve(
+        board=board,
+        pot=1000,
+        stacks=(5000, 0),
+        bets=(0, 5000),
+        active_player=0,
+        range_p0=r0,
+        range_p1=r1_value_heavy,
+        actions_taken=1,
+        raises_taken=1,
+        last_raise=5000,
+        big_blind=100,
+        iterations=100,
+    )
+    assert res_fold.root_node is not None
+    # Verify exact zero-sum c0 == c1 at every showdown leaf in the mid-street tree.
+    stack = [res_fold.root_node]
+    while stack:
+        nd = stack.pop()
+        if nd.kind == "showdown":
+            assert abs(nd.c0 - nd.c1) < 1e-5
+            assert abs(nd.c0 - 5500.0) < 1e-5
+        stack.extend(nd.children)
+
+    pos = int(np.searchsorted(res_fold.combo_indices, combo_id(*catcher)))
+    fold_idx = next(i for i, (a, _) in enumerate(res_fold.actions) if a == c.ACTION_FOLD)
+    call_idx = next(i for i, (a, _) in enumerate(res_fold.actions) if a == c.ACTION_CALL)
+    assert float(res_fold.strategy[fold_idx, pos]) > 0.99
+
+    # Case 2: Villain has 50% nuts / 50% air -> Hero has 50% equity (> 45.45%) -> must 100% CALL.
+    r1_bluff_heavy = np.zeros(NUM_COMBOS, dtype=np.float32)
+    r1_bluff_heavy[combo_id(*nuts)] = 0.50
+    r1_bluff_heavy[combo_id(*air)] = 0.50
+    res_call = solver.solve(
+        board=board,
+        pot=1000,
+        stacks=(5000, 0),
+        bets=(0, 5000),
+        active_player=0,
+        range_p0=r0,
+        range_p1=r1_bluff_heavy,
+        actions_taken=1,
+        raises_taken=1,
+        last_raise=5000,
+        big_blind=100,
+        iterations=100,
+    )
+    pos2 = int(np.searchsorted(res_call.combo_indices, combo_id(*catcher)))
+    assert float(res_call.strategy[call_idx, pos2]) > 0.99
