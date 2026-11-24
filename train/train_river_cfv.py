@@ -374,12 +374,25 @@ def main() -> int:
     p.add_argument("--num-blocks", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--gen-device",
+        type=str,
+        default="cpu",
+        help="Device for DCFR dataset generation ('cpu' recommended with --workers > 1).",
+    )
+    p.add_argument(
+        "--bet-fractions",
+        type=str,
+        default="0.5,1.0",
+        help="Comma-separated river bet fractions (plus all-in) used for exact Nash solves.",
+    )
     p.add_argument("--save-data", type=Path, default=None)
     p.add_argument("--load-data", type=Path, default=None)
     p.add_argument("--out", type=Path, default=Path("checkpoints/river_cfv_v1.pt"))
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
+    bet_fracs = tuple(float(x.strip()) for x in args.bet_fractions.split(",") if x.strip())
     if args.load_data is not None:
         npz = np.load(args.load_data)
         data = {k: npz[k] for k in npz.files}
@@ -388,8 +401,9 @@ def main() -> int:
         data = generate_dataset(
             num_samples=args.samples,
             iters=args.iters,
-            device=args.device,
+            device=args.gen_device,
             seed=args.seed,
+            bet_fractions=bet_fracs,
             workers=args.workers,
         )
         if args.save_data is not None:
