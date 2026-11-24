@@ -25,6 +25,7 @@ from train.policy_factory import PolicyNet, load_snapshot_model  # noqa: E402
 from train.policy_factory import make_policy as _make_policy  # noqa: E402
 from train.policy_factory import push_transformer_token as _push_transformer_token  # noqa: E402
 from train.policy_factory import stage_from_scalars as _stage_from_scalars  # noqa: E402
+from train.rnad_runner import _run_impl_rnad  # noqa: E402
 from train.single_runner import _run_impl  # noqa: E402
 from train.triad_runner import _run_impl_triad  # noqa: E402
 
@@ -58,6 +59,8 @@ def run(cfg: TrainConfig) -> TrainResult:
             print(f"[warn] pynvml.nvmlInit() failed ({e!r}); disabling NVML metrics")
             use_nvml = False
     try:
+        if cfg.rnad_enabled:
+            return _run_impl_rnad(cfg)
         if cfg.triad_enabled:
             return _run_impl_triad(cfg)
         return _run_impl(cfg)

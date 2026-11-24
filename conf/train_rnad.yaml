@@ -1,0 +1,110 @@
+# Regularized Nash Dynamics (R-NaD) with suit-canonical Card-Token Transformer
+# and CTDE omniscient critic.
+# Run with: uv run python train/train.py --config-name=train_rnad
+
+device: cuda:0
+num_envs: 65536
+rollout_steps: 64
+# Slumbot-matching stakes (50/100) with randomized [40, 200] BB stack depths.
+starting_stack: 20000
+starting_stack_min: 4000
+starting_stack_max: 20000
+small_blind: 50
+big_blind: 100
+total_env_steps: 4000000000
+num_updates: 0
+
+lr: 3.0e-4
+# Undiscounted episodic poker returns (hands are short, ~4-12 actions).
+gamma: 1.0
+gae_lambda: 0.95
+clip_eps: 0.2
+value_coef: 0.5
+entropy_coef: 0.005
+max_grad_norm: 1.0
+
+policy_backbone: transformer
+transformer_d_model: 256
+transformer_n_heads: 4
+transformer_n_layers: 4
+transformer_ffn_dim: 1024
+
+# LSTM fields (unused when policy_backbone=transformer).
+card_embed_dim: 64
+mlp_dim: 256
+torso_layers: 2
+lstm_hidden: 256
+head_layers: 0
+head_dim: null
+
+num_epochs: 4
+minibatch_size: 65536
+seed: 42
+log_every_env_steps: 4194304
+log_every_seconds: 1.0
+
+checkpoint_dir: checkpoints/rnad
+save_every_env_steps: 100000000
+resume_from: ""
+
+eval_every: 25
+eval_hands: 10000
+eval_max_steps: 5000000
+
+# Unused legacy league knobs (required by TrainConfig schema).
+league_enabled: false
+league_eta_selfplay: 1.0
+league_bot_initial_score: 0.0
+league_eval_bots: false
+league_eval_bots_every: 100
+league_snapshot_pool: 0
+league_snapshot_every_updates: 0
+league_eval_every_updates: 0
+league_eval_hands: 0
+league_eval_subset: 0
+league_eval_deterministic: false
+league_eval_seat_swap: true
+league_pfsp_temperature: 1.0
+league_pfsp_epsilon: 1.0e-3
+league_pfsp_mode: hard
+league_pfsp_q: 2.0
+league_train_on_bots: false
+league_rollout_snapshot_k: 0
+
+selfplay_eval_enabled: false
+selfplay_eval_every_updates: 0
+selfplay_eval_hands: 0
+selfplay_eval_subset: 0
+selfplay_eval_deterministic: false
+selfplay_eval_seat_swap: true
+
+timing_sync: true
+compile_policy: false
+use_amp: true
+amp_dtype: auto
+autotune: false
+use_cuda_graph: false
+
+# R-NaD + CTDE omniscient critic
+rnad_enabled: true
+rnad_eta: 0.2
+rnad_reg_update_every: 40
+rnad_kl_clip: 10.0
+use_omniscient_critic: true
+
+# Opt-in MLflow tracking.
+mlflow_enabled: false
+mlflow_experiment: null
+mlflow_run_name: null
+mlflow_tags:
+  - rnad
+  - transformer
+mlflow_notes: null
+mlflow_extra_tags: null
+mlflow_upload_checkpoints: none
+
+hydra:
+  run:
+    dir: train/outputs/rnad/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true
