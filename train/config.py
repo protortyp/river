@@ -118,6 +118,8 @@ class TrainConfig:
     rnad_reg_update_every: int = 40
     rnad_kl_clip: float = 10.0
     use_omniscient_critic: bool = True
+    lr_end: float | None = None
+    entropy_coef_end: float | None = None
 
     # MLflow tracking (opt-in)
     mlflow_enabled: bool = False

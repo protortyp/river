@@ -204,6 +204,8 @@ def test_rnad_runner_cpu_smoke(tmp_path):
         rnad_eta=0.2,
         rnad_reg_update_every=1,
         use_omniscient_critic=True,
+        lr_end=3e-5,
+        entropy_coef_end=0.001,
         mlflow_enabled=False,
     )
     res = run(cfg)
@@ -256,3 +258,43 @@ def test_dynamic_history_trim_matches_full_sequence():
             cards=cards_full, scalars=scalars_full, tokens=tokens_full, lengths=lengths_full
         )
     assert torch.allclose(lat_trimmed, lat_full[:4], atol=1e-5)
+
+
+def test_legacy_transformer_encoder_state_dict_loads_into_sdpa_blocks():
+    """Pre-SDPA checkpoints with `encoder.layers.*` keys remap losslessly onto `blocks.layers.*`."""
+    torch.manual_seed(11)
+    src = PokerTransformerPolicyNet(
+        scalar_dim=17, d_model=32, n_heads=4, n_layers=2, ffn_dim=64
+    ).eval()
+    legacy_sd: dict[str, torch.Tensor] = {}
+    for k, v in src.state_dict().items():
+        if k.startswith("omni_norm_") or k.startswith("omni_cross_attn."):
+            continue
+        if k.startswith("blocks.layers."):
+            rest = k[len("blocks.layers.") :]
+            rest = rest.replace(".in_proj.weight", ".self_attn.in_proj_weight")
+            rest = rest.replace(".in_proj.bias", ".self_attn.in_proj_bias")
+            rest = rest.replace(".out_proj.", ".self_attn.out_proj.")
+            legacy_sd[f"encoder.layers.{rest}"] = v.clone()
+        else:
+            legacy_sd[k] = v.clone()
+
+    dst = PokerTransformerPolicyNet(
+        scalar_dim=17, d_model=32, n_heads=4, n_layers=2, ffn_dim=64
+    ).eval()
+    dst.load_state_dict(legacy_sd, strict=True)
+
+    cards = torch.randint(-1, 52, (4, 7), dtype=torch.int32)
+    scalars = torch.randn((4, 17))
+    h, c_ = PokerTransformerPolicyNet.init_state(4, 0, torch.device("cpu"))
+    mask = torch.ones((4, 4), dtype=torch.bool)
+    with torch.no_grad():
+        o1 = src.forward_step(
+            cards=cards, scalars=scalars, action_mask=mask, h=h, c=c_, deterministic=True
+        )
+        o2 = dst.forward_step(
+            cards=cards, scalars=scalars, action_mask=mask, h=h, c=c_, deterministic=True
+        )
+    assert torch.equal(o1.action_type, o2.action_type)
+    assert torch.allclose(o1.logprob, o2.logprob, atol=1e-6)
+    assert torch.allclose(o1.value, o2.value, atol=1e-6)

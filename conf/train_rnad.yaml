@@ -15,12 +15,14 @@ total_env_steps: 4000000000
 num_updates: 0
 
 lr: 3.0e-4
+lr_end: 3.0e-5
 # Undiscounted episodic poker returns (hands are short, ~4-12 actions).
 gamma: 1.0
 gae_lambda: 0.95
 clip_eps: 0.2
 value_coef: 0.5
 entropy_coef: 0.005
+entropy_coef_end: 0.0005
 max_grad_norm: 1.0
 
 policy_backbone: transformer

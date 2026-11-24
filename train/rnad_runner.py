@@ -15,6 +15,7 @@ Implements the zero-sum reward-transformed self-play algorithm from Perolat et a
 from __future__ import annotations
 
 import copy
+import math
 import os
 import time
 from dataclasses import asdict
@@ -118,6 +119,14 @@ def _run_impl_rnad(cfg: TrainConfig) -> TrainResult:
         env_steps = int(ckpt_state.env_steps)
         opt_steps = int(ckpt_state.opt_steps)
         update = int(ckpt_state.update)
+
+    # Compile only the inner Transformer block stack (after checkpoint loading) to get
+    # Inductor fusion without graph breaks on dynamic sequence trimming or `_orig_mod.` keys.
+    if cfg.compile_policy and is_transformer and device.type == "cuda":
+        assert isinstance(net, PokerTransformerPolicyNet)
+        net.blocks = torch.compile(net.blocks, dynamic=True)  # type: ignore[assignment]
+        if isinstance(net_reg, PokerTransformerPolicyNet):
+            net_reg.blocks = torch.compile(net_reg.blocks, dynamic=True)  # type: ignore[assignment]
 
     hidden = int(net.lstm_hidden)
     buf = RolloutBuffer(
@@ -386,6 +395,22 @@ def _run_impl_rnad(cfg: TrainConfig) -> TrainResult:
 
         # ---- 3. Clipped PPO update on regularized advantages --------------
         t_ppo_start = _t_now()
+        progress = min(1.0, float(env_steps) / float(pbar_total)) if pbar_total > 0 else 0.0
+        cur_lr = (
+            float(cfg.lr_end)
+            + 0.5 * (float(cfg.lr) - float(cfg.lr_end)) * (1.0 + math.cos(math.pi * progress))
+            if cfg.lr_end is not None
+            else float(cfg.lr)
+        )
+        for pg in opt.param_groups:
+            pg["lr"] = cur_lr
+        cur_ent_coef = (
+            float(cfg.entropy_coef)
+            + (float(cfg.entropy_coef_end) - float(cfg.entropy_coef)) * progress
+            if cfg.entropy_coef_end is not None
+            else float(cfg.entropy_coef)
+        )
+
         mb_size = int(cfg.minibatch_size)
         num_mbs = (total + mb_size - 1) // max(1, mb_size)
 
@@ -450,7 +475,7 @@ def _run_impl_rnad(cfg: TrainConfig) -> TrainResult:
                     loss = (
                         policy_loss
                         + float(cfg.value_coef) * value_loss
-                        - float(cfg.entropy_coef) * entropy_bonus
+                        - cur_ent_coef * entropy_bonus
                     )
 
                 with torch.no_grad():
@@ -500,7 +525,22 @@ def _run_impl_rnad(cfg: TrainConfig) -> TrainResult:
 
         # ---- 4. Outer-loop R-NaD anchor update ----------------------------
         if (update + 1) % reg_update_every == 0:
-            net_reg.load_state_dict(net.state_dict())
+            raw_sd = {k.replace("_orig_mod.", ""): v for k, v in net.state_dict().items()}
+            target_reg = net_reg
+            if isinstance(target_reg, PokerTransformerPolicyNet) and hasattr(
+                target_reg.blocks, "_orig_mod"
+            ):
+                reg_sd = {
+                    (
+                        k.replace("blocks.", "blocks._orig_mod.", 1)
+                        if k.startswith("blocks.")
+                        else k
+                    ): v
+                    for k, v in raw_sd.items()
+                }
+                target_reg.load_state_dict(reg_sd)
+            else:
+                target_reg.load_state_dict(raw_sd)
             reg_updates += 1
 
         # ---- 5. Periodic duplicate-deck eval ------------------------------
