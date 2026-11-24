@@ -1092,7 +1092,7 @@ def run(
                         prune_eps=1e-4,
                         keep_combo=hero_cid,
                     )
-                    probs = res.action_probs_for_hand(state.hole_cards_hero)
+                    probs = res.action_probs_for_hand(hole)
                     probs = probs / max(1e-12, float(probs.sum()))
                     if deterministic:
                         chosen_idx = int(np.argmax(probs))
@@ -1102,12 +1102,15 @@ def run(
                     used_search = True
                     river_solves += 1
                 except Exception as e:
-                    if verbose:
-                        print(f"  [river_search fallback]: {e}")
+                    print(f"[hand {hand_i}] river_search fallback: {e}")
 
             if not used_search:
                 action_type, raise_bucket = policy.act(obs)
                 mask, min_d, max_d = state.legal_actions()
+                # Slumbot forbids folding when checking is free (to_call == 0); checking
+                # strictly dominates folding in that state.
+                if action_type == const.ACTION_FOLD and mask[const.ACTION_CHECK]:
+                    action_type = const.ACTION_CHECK
                 if not mask[action_type]:
                     if mask[const.ACTION_CHECK]:
                         action_type = const.ACTION_CHECK
