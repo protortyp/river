@@ -1045,6 +1045,7 @@ def run(
     device: str = "cpu",
     workers: int = 1,
     log_every: int = 25,
+    cfv_net_path: str | None = None,
 ) -> None:
     policy: OnnxPolicy | TorchPolicy
     if checkpoint_path is not None:
@@ -1058,11 +1059,17 @@ def run(
         policy = OnnxPolicy(model_path, deterministic=deterministic, intra_threads=intra_threads)
     else:
         raise ValueError("Provide either --model (ONNX) or --checkpoint (PyTorch)")
+    cfv_net = None
+    if cfv_net_path is not None:
+        from gpu_poker.cfv_net import load_cfv_checkpoint
+
+        cfv_net = load_cfv_checkpoint(cfv_net_path, device=search_device)
     solver = (
         RiverDCFRSolver(
             bet_fractions=(0.33, 0.75, 1.5) if search_device.startswith("cuda") else (0.5, 1.0),
             max_raises=search_max_raises,
             device=search_device,
+            cfv_net=cfv_net,
         )
         if (river_search or turn_search)
         else None
@@ -1484,6 +1491,12 @@ def main() -> int:
         help="ONNX Runtime intra-op CPU threads (0 = runtime default).",
     )
     p.add_argument(
+        "--cfv-net",
+        type=str,
+        default=None,
+        help="Optional ReBeL RiverCFVNet checkpoint (.pt) for deep-SPR Turn leaf evaluation.",
+    )
+    p.add_argument(
         "--log-every",
         type=int,
         default=25,
@@ -1507,6 +1520,7 @@ def main() -> int:
         device=str(args.device),
         workers=int(args.workers),
         log_every=int(args.log_every),
+        cfv_net_path=args.cfv_net,
     )
     return 0
 

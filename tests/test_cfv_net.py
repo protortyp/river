@@ -85,3 +85,54 @@ def test_river_cfv_net_exact_zero_sum_spr_zero_and_smoke_train(tmp_path):
     out_p = save_cfv_checkpoint(tmp_path / "cfv.pt", trained)
     reloaded = load_cfv_checkpoint(out_p, device="cpu")
     assert reloaded.hidden_dim == 32
+
+
+def test_turn_dcfr_with_zero_init_cfv_net_matches_exact_checkdown_and_caps_deep_jams():
+    """Zero-init RiverCFVNet equals exact checkdown equity -> Turn DCFR matches identically."""
+    board4 = [_card("2", "c"), _card("3", "d"), _card("7", "h"), _card("8", "s")]
+    aa = (_card("A", "h"), _card("A", "s"))
+    air = (_card("4", "c"), _card("5", "d"))
+    kk = (_card("K", "h"), _card("K", "s"))
+    r0 = np.zeros(NUM_COMBOS, dtype=np.float32)
+    r0[combo_id(*aa)] = 0.5
+    r0[combo_id(*air)] = 0.5
+    r1 = np.zeros(NUM_COMBOS, dtype=np.float32)
+    r1[combo_id(*kk)] = 1.0
+
+    # Deep SPR = 10 -> turn_all_in_max_spr=3.0 suppresses absurd 10x-pot all-in turn shove.
+    s_base = RiverDCFRSolver(bet_fractions=(1.0,), max_raises=1, turn_all_in_max_spr=3.0)
+    res_base = s_base.solve(
+        board=board4,
+        pot=100,
+        stacks=(1000, 1000),
+        bets=(0, 0),
+        active_player=0,
+        range_p0=r0,
+        range_p1=r1,
+        big_blind=10,
+        iterations=30,
+    )
+    assert all(amt <= 100 for _, amt in res_base.actions)
+
+    # With zero-init RiverCFVNet (all 48 river cards), Turn DCFR matches exact checkdown.
+    zero_net = RiverCFVNet(hidden_dim=32, num_blocks=1)
+    s_cfv = RiverDCFRSolver(
+        bet_fractions=(1.0,),
+        max_raises=1,
+        cfv_net=zero_net,
+        turn_all_in_max_spr=3.0,
+        cfv_sample_rivers=48,
+    )
+    res_cfv = s_cfv.solve(
+        board=board4,
+        pot=100,
+        stacks=(1000, 1000),
+        bets=(0, 0),
+        active_player=0,
+        range_p0=r0,
+        range_p1=r1,
+        big_blind=10,
+        iterations=30,
+    )
+    assert res_cfv.actions == res_base.actions
+    assert np.allclose(res_cfv.strategy, res_base.strategy, atol=1e-4)
