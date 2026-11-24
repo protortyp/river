@@ -163,3 +163,52 @@ def test_belief_tracker_masks_board_and_bayes_updates():
     bt.update_action(0, lik, active_indices=active)
     assert bt.ranges[0][target_cid] > 0.05
     assert abs(bt.ranges[0].sum() - 1.0) < 1e-6
+
+
+def test_disjoint_mass_matches_dense_matrix_and_slumbot_river_action_lookup():
+    from train.slumbot_eval import HUNLState, _board_per_street, format_action_for_slumbot
+
+    from gpu_poker.search import _disjoint_mass, build_river_matrices
+
+    board_strs = ["As", "Ks", "7d", "3c", "2s"]
+    bps = _board_per_street(board_strs)
+    combos = unblocked_combo_indices(bps[3])
+    c0 = COMBO_C0[combos]
+    c1 = COMBO_C1[combos]
+    ranks = RiverHandEvaluator().eval_river_combos(np.stack([c0, c1], axis=1), bps[3])
+    _, d_mat = build_river_matrices(combos, ranks)
+
+    rng = np.random.default_rng(7)
+    r = rng.random(len(combos), dtype=np.float32)
+    assert np.allclose(_disjoint_mass(r, c0, c1), d_mat @ r, atol=1e-3)
+
+    # End-to-end river solve lookup on HUNLState (matching slumbot_eval driver).
+    hole = [_card("Q", "s"), _card("J", "s")]
+    st = HUNLState(button=1, hero_seat=0, hole_cards_hero=hole)
+    st.stage = c.STAGE_RIVER
+    st.pot = 1000
+    st.bets = [0, 0]
+    st.stacks = [19500, 19500]
+    st.active_player = 0
+    st.actions_this_street = 0
+    st.reveal_board(bps[3])
+
+    solver = RiverDCFRSolver(bet_fractions=(0.5, 1.0), max_raises=2)
+    res = solver.solve(
+        board=bps[3],
+        pot=st.pot,
+        stacks=(st.stacks[0], st.stacks[1]),
+        bets=(st.bets[0], st.bets[1]),
+        active_player=st.active_player,
+        range_p0=np.ones(NUM_COMBOS, dtype=np.float32),
+        range_p1=np.ones(NUM_COMBOS, dtype=np.float32),
+        actions_taken=st.actions_this_street,
+        big_blind=st.bb_chips,
+        iterations=30,
+        keep_combo=combo_id(hole[0], hole[1]),
+    )
+    probs = res.action_probs_for_hand(hole)
+    assert abs(float(probs.sum()) - 1.0) < 1e-5
+    act_type, amt = res.actions[int(np.argmax(probs))]
+    incr = format_action_for_slumbot(st, act_type, amt)
+    assert incr == "k" or incr.startswith("b")
