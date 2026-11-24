@@ -837,40 +837,33 @@ class TorchPolicy:
             c_t = torch.zeros(
                 (1, n_eval, self.state_width), device=self.device, dtype=torch.float32
             )
-            if int(taken_action) == const.ACTION_RAISE and len(bw) > 1:
-                p_acc = torch.zeros((n_eval,), device=self.device, dtype=torch.float32)
-                act_t = torch.full(
-                    (n_eval,), int(taken_action), device=self.device, dtype=torch.int64
-                )
-                for b_idx, b_w in bw:
-                    bkt_t = torch.full((n_eval,), int(b_idx), device=self.device, dtype=torch.int64)
-                    eo = self.net.evaluate_step(  # type: ignore[operator]
-                        cards=cards_t,
-                        scalars=scalars_t,
-                        action_mask=mask_t,
-                        action_type=act_t,
-                        raise_bucket=bkt_t,
-                        h=h_t,
-                        c=c_t,
-                    )
-                    p_acc = p_acc + float(b_w) * torch.exp(eo.logprob.to(dtype=torch.float32))
-                p_act = p_acc.cpu().numpy()
-            else:
-                b_single = bw[0][0] if bw else int(taken_bucket)
-                act_t = torch.full(
-                    (n_eval,), int(taken_action), device=self.device, dtype=torch.int64
-                )
-                bkt_t = torch.full((n_eval,), int(b_single), device=self.device, dtype=torch.int64)
-                eo = self.net.evaluate_step(  # type: ignore[operator]
+            if self.is_transformer:
+                tokens_t, lengths_t = self.net.unpack_state(h_t)  # type: ignore[operator]
+                act_dist, raise_dist, _, _, _, _ = self.net._forward_latent(  # type: ignore[operator]
                     cards=cards_t,
                     scalars=scalars_t,
                     action_mask=mask_t,
-                    action_type=act_t,
-                    raise_bucket=bkt_t,
+                    tokens=tokens_t,
+                    lengths=lengths_t,
+                    terminated=None,
+                )
+            else:
+                act_dist, raise_dist, _, _, _ = self.net._forward_latent(  # type: ignore[operator]
+                    cards=cards_t,
+                    scalars=scalars_t,
+                    action_mask=mask_t,
                     h=h_t,
                     c=c_t,
+                    terminated=None,
                 )
-                p_act = torch.exp(eo.logprob.to(dtype=torch.float32)).cpu().numpy()
+            p_act_t = act_dist.probs[:, int(taken_action)].to(dtype=torch.float32)
+            if int(taken_action) == const.ACTION_RAISE:
+                rb_probs = raise_dist.probs.to(dtype=torch.float32)
+                p_bkt = torch.zeros_like(p_act_t)
+                for b_idx, b_w in bw:
+                    p_bkt = p_bkt + float(b_w) * rb_probs[:, int(b_idx)]
+                p_act_t = p_act_t * p_bkt
+            p_act = p_act_t.cpu().numpy()
 
         res = p_act[inv].astype(np.float32) if inv is not None else p_act.astype(np.float32)
         if cache_key is not None and len(self._preflop_cache) < 512:
@@ -1051,6 +1044,7 @@ def run(
     config_path: str | None = None,
     device: str = "cpu",
     workers: int = 1,
+    log_every: int = 25,
 ) -> None:
     policy: OnnxPolicy | TorchPolicy
     if checkpoint_path is not None:
@@ -1164,44 +1158,43 @@ def run(
                         turn_acts = _street_actions_from_str(
                             button, action_str, bps, const.STAGE_TURN
                         )
-                        with infer_lock:
-                            if turn_session is None:
-                                bt = compute_river_beliefs(
-                                    policy=policy,
-                                    button=button,
-                                    action_str=action_str,
-                                    board_per_street=bps,
-                                    keep_combo=hero_cid,
-                                )
-                                turn_session = RiverSubgameSession(
-                                    solver=solver,
-                                    board=bps[2],
-                                    range_p0=bt.ranges[0],
-                                    range_p1=bt.ranges[1],
-                                    big_blind=state.bb_chips,
-                                    iterations=search_iters,
-                                    prune_eps=1e-4,
-                                    keep_combo=hero_cid,
-                                )
-                                turn_tokens_seen = len(turn_acts)
-                            else:
-                                for _pid, v_act, v_delta in turn_acts[turn_tokens_seen:]:
-                                    turn_session.observe_action(v_act, v_delta)
-                                turn_tokens_seen = len(turn_acts)
-
-                            prev_solves = turn_session.solves_run
-                            action_type, amount = turn_session.act(
-                                pot=state.pot,
-                                stacks=(state.stacks[0], state.stacks[1]),
-                                bets=(state.bets[0], state.bets[1]),
-                                active_player=state.active_player,
-                                actions_taken=state.actions_this_street,
-                                raises_taken=state.num_raises,
-                                last_raise=state.last_raise,
-                                hole_cards=hole,
-                                deterministic=deterministic,
+                        if turn_session is None:
+                            bt = compute_river_beliefs(
+                                policy=policy,
+                                button=button,
+                                action_str=action_str,
+                                board_per_street=bps,
+                                keep_combo=hero_cid,
                             )
-                            new_solve = turn_session.solves_run > prev_solves
+                            turn_session = RiverSubgameSession(
+                                solver=solver,
+                                board=bps[2],
+                                range_p0=bt.ranges[0],
+                                range_p1=bt.ranges[1],
+                                big_blind=state.bb_chips,
+                                iterations=search_iters,
+                                prune_eps=1e-4,
+                                keep_combo=hero_cid,
+                            )
+                            turn_tokens_seen = len(turn_acts)
+                        else:
+                            for _pid, v_act, v_delta in turn_acts[turn_tokens_seen:]:
+                                turn_session.observe_action(v_act, v_delta)
+                            turn_tokens_seen = len(turn_acts)
+
+                        prev_solves = turn_session.solves_run
+                        action_type, amount = turn_session.act(
+                            pot=state.pot,
+                            stacks=(state.stacks[0], state.stacks[1]),
+                            bets=(state.bets[0], state.bets[1]),
+                            active_player=state.active_player,
+                            actions_taken=state.actions_this_street,
+                            raises_taken=state.num_raises,
+                            last_raise=state.last_raise,
+                            hole_cards=hole,
+                            deterministic=deterministic,
+                        )
+                        new_solve = turn_session.solves_run > prev_solves
                         turn_tokens_seen += 1
                         used_search = True
                         with stats_lock:
@@ -1224,59 +1217,86 @@ def run(
                         riv_acts = _street_actions_from_str(
                             button, action_str, bps, const.STAGE_RIVER
                         )
-                        with infer_lock:
-                            if river_session is None:
-                                if turn_session is not None and len(riv_acts) == 0:
-                                    # Continual re-solving handoff: observe closing turn actions
-                                    # and transfer Turn-solved ranges directly to the river.
-                                    turn_acts = _street_actions_from_str(
-                                        button, action_str, bps, const.STAGE_TURN
-                                    )
-                                    for _pid, v_act, v_delta in turn_acts[turn_tokens_seen:]:
-                                        turn_session.observe_action(v_act, v_delta)
-                                    river_session = turn_session.handoff_to_river(
-                                        river_card=bps[3][4],
-                                        river_solver=solver,
-                                        keep_combo=hero_cid,
-                                    )
-                                    river_tokens_seen = 0
-                                else:
-                                    bt = compute_river_beliefs(
-                                        policy=policy,
-                                        button=button,
-                                        action_str=action_str,
-                                        board_per_street=bps,
-                                        keep_combo=hero_cid,
-                                    )
-                                    river_session = RiverSubgameSession(
-                                        solver=solver,
+                        if river_session is None:
+                            if turn_session is not None:
+                                # Continual re-solving handoff: observe closing turn actions and
+                                # transfer Turn-solved ranges directly to the river without
+                                # re-running preflop/flop/turn blueprint beliefs.
+                                turn_acts = _street_actions_from_str(
+                                    button, action_str, bps, const.STAGE_TURN
+                                )
+                                for _pid, v_act, v_delta in turn_acts[turn_tokens_seen:]:
+                                    turn_session.observe_action(v_act, v_delta)
+                                river_session = turn_session.handoff_to_river(
+                                    river_card=bps[3][4],
+                                    river_solver=solver,
+                                    keep_combo=hero_cid,
+                                )
+                                if len(riv_acts) > 0:
+                                    # Villain acted first on the river: solve river entry tree once
+                                    # and observe Villain's action under exact river GTO ranges.
+                                    entry_res = solver.solve(
                                         board=bps[3],
-                                        range_p0=bt.ranges[0],
-                                        range_p1=bt.ranges[1],
+                                        pot=state.pot,
+                                        stacks=(
+                                            state.stacks[0] + state.bets[0],
+                                            state.stacks[1] + state.bets[1],
+                                        ),
+                                        bets=(0, 0),
+                                        active_player=1 - button,
+                                        range_p0=river_session.ranges[0],
+                                        range_p1=river_session.ranges[1],
+                                        actions_taken=0,
+                                        raises_taken=0,
+                                        last_raise=0,
                                         big_blind=state.bb_chips,
                                         iterations=search_iters,
                                         prune_eps=1e-4,
                                         keep_combo=hero_cid,
                                     )
-                                    river_tokens_seen = len(riv_acts)
-                            else:
-                                for _pid, v_act, v_delta in riv_acts[river_tokens_seen:]:
-                                    river_session.observe_action(v_act, v_delta)
+                                    river_session.solves_run += 1
+                                    river_session.current_node = entry_res.root_node
+                                    river_session.combo_indices = entry_res.combo_indices
+                                    for _pid, v_act, v_delta in riv_acts:
+                                        river_session.observe_action(v_act, v_delta)
                                 river_tokens_seen = len(riv_acts)
+                            else:
+                                bt = compute_river_beliefs(
+                                    policy=policy,
+                                    button=button,
+                                    action_str=action_str,
+                                    board_per_street=bps,
+                                    keep_combo=hero_cid,
+                                )
+                                river_session = RiverSubgameSession(
+                                    solver=solver,
+                                    board=bps[3],
+                                    range_p0=bt.ranges[0],
+                                    range_p1=bt.ranges[1],
+                                    big_blind=state.bb_chips,
+                                    iterations=search_iters,
+                                    prune_eps=1e-4,
+                                    keep_combo=hero_cid,
+                                )
+                                river_tokens_seen = len(riv_acts)
+                        else:
+                            for _pid, v_act, v_delta in riv_acts[river_tokens_seen:]:
+                                river_session.observe_action(v_act, v_delta)
+                            river_tokens_seen = len(riv_acts)
 
-                            prev_solves = river_session.solves_run
-                            action_type, amount = river_session.act(
-                                pot=state.pot,
-                                stacks=(state.stacks[0], state.stacks[1]),
-                                bets=(state.bets[0], state.bets[1]),
-                                active_player=state.active_player,
-                                actions_taken=state.actions_this_street,
-                                raises_taken=state.num_raises,
-                                last_raise=state.last_raise,
-                                hole_cards=hole,
-                                deterministic=deterministic,
-                            )
-                            new_solve = river_session.solves_run > prev_solves
+                        prev_solves = river_session.solves_run
+                        action_type, amount = river_session.act(
+                            pot=state.pot,
+                            stacks=(state.stacks[0], state.stacks[1]),
+                            bets=(state.bets[0], state.bets[1]),
+                            active_player=state.active_player,
+                            actions_taken=state.actions_this_street,
+                            raises_taken=state.num_raises,
+                            last_raise=state.last_raise,
+                            hole_cards=hole,
+                            deterministic=deterministic,
+                        )
+                        new_solve = river_session.solves_run > prev_solves
                         river_tokens_seen += 1
                         used_search = True
                         with stats_lock:
@@ -1365,7 +1385,7 @@ def run(
                 hands_played += 1
                 deltas.append(int(delta))
                 done_n = hands_played
-                if verbose or done_n % 50 == 0:
+                if verbose or done_n % max(1, int(log_every)) == 0:
                     elapsed = time.perf_counter() - t0
                     mean_chips = chip_total / max(1, done_n)
                     bb_per_100 = (mean_chips / SLUMBOT_BB) * 100.0
@@ -1463,6 +1483,12 @@ def main() -> int:
         default=0,
         help="ONNX Runtime intra-op CPU threads (0 = runtime default).",
     )
+    p.add_argument(
+        "--log-every",
+        type=int,
+        default=25,
+        help="Print running bb/100 + mbb/g progress every N hands.",
+    )
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
     run(
@@ -1480,6 +1506,7 @@ def main() -> int:
         config_path=args.config,
         device=str(args.device),
         workers=int(args.workers),
+        log_every=int(args.log_every),
     )
     return 0
 
