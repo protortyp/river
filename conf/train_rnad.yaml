@@ -86,8 +86,9 @@ autotune: false
 use_cuda_graph: false
 
 # R-NaD + CTDE omniscient critic
+# Rewards are in units of 100 BB (1 BB = 0.01), so eta=0.015 is ~1.5 BB per nat of KL.
 rnad_enabled: true
-rnad_eta: 0.2
+rnad_eta: 0.015
 rnad_reg_update_every: 40
 rnad_kl_clip: 10.0
 use_omniscient_critic: true
