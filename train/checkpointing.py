@@ -84,8 +84,13 @@ def load_checkpoint(
     }
     model.load_state_dict(sd)
     if optimizer is not None and payload.get("optimizer") is not None:
-        optimizer.load_state_dict(payload["optimizer"])
-        _move_optimizer_state_to_device(optimizer, device)
+        try:
+            optimizer.load_state_dict(payload["optimizer"])
+            _move_optimizer_state_to_device(optimizer, device)
+        except ValueError as exc:
+            # Occurs when resuming a legacy checkpoint into a model with added training-only
+            # heads (e.g., CTDE cross-attention); keep model weights and reset optimizer moments.
+            print(f"[checkpoint] optimizer state mismatch ({exc}); starting fresh optimizer state")
 
     rng = payload.get("rng") or {}
     if "torch" in rng and rng["torch"] is not None:
