@@ -112,6 +112,13 @@ class TrainConfig:
     triad_entropy_me: float | None = None
     triad_entropy_le: float | None = None
 
+    # R-NaD (Regularized Nash Dynamics) & CTDE omniscient critic
+    rnad_enabled: bool = False
+    rnad_eta: float = 0.2
+    rnad_reg_update_every: int = 50
+    rnad_kl_clip: float = 10.0
+    use_omniscient_critic: bool = True
+
     # MLflow tracking (opt-in)
     mlflow_enabled: bool = False
     mlflow_experiment: str | None = None

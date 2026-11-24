@@ -8,7 +8,39 @@ from gpu_poker.policy import (
     raise_bucket_to_amount,
     raise_frac_to_amount,
 )
+from gpu_poker.policy_transformer import PokerTransformerPolicyNet, push_action_token_packed
 from train import bots
+
+
+def _is_transformer(policy: object) -> bool:
+    unwrapped = getattr(policy, "_orig_mod", policy)
+    return isinstance(unwrapped, PokerTransformerPolicyNet)
+
+
+def _push_if_transformer(
+    policy: object,
+    h: torch.Tensor,
+    *,
+    player_id: torch.Tensor,
+    action_type: torch.Tensor,
+    raise_bucket: torch.Tensor,
+    scalars: torch.Tensor,
+) -> torch.Tensor:
+    if not _is_transformer(policy):
+        return h
+    stage = (scalars[..., 7] * 5.0).round().to(dtype=torch.int32)
+    bucket = torch.where(
+        action_type.eq(c.ACTION_RAISE),
+        raise_bucket.to(dtype=torch.int32),
+        torch.zeros_like(raise_bucket, dtype=torch.int32),
+    )
+    return push_action_token_packed(
+        h,
+        player_id=player_id.to(dtype=torch.int32),
+        action_type=action_type,
+        raise_bucket=bucket,
+        stage=stage,
+    )
 
 
 def _street_from_scalars(scalars: torch.Tensor) -> torch.Tensor:
@@ -175,6 +207,17 @@ def eval_vs_bot(
         amounts = torch.where(action_type.eq(c.ACTION_RAISE), amounts, torch.zeros_like(amounts))
 
         next_obs = env.step(action_type, amounts)
+
+        if _is_transformer(policy):
+            rb_step = torch.zeros((env.num_envs,), device=device, dtype=torch.int64)
+            h0 = _push_if_transformer(
+                policy,
+                h0,
+                player_id=pid,
+                action_type=action_type,
+                raise_bucket=rb_step,
+                scalars=obs["scalars"],
+            )
 
         # Terminal reward is P0 reward in chips; convert to learner bb with per-env bb.
         term = next_obs["terminated"].to(dtype=torch.bool)
@@ -372,6 +415,23 @@ def eval_vs_snapshot_mix(
         amounts = torch.where(action_type.eq(c.ACTION_RAISE), amounts, torch.zeros_like(amounts))
 
         next_obs = env.step(action_type, amounts)
+        h_learner = _push_if_transformer(
+            policy,
+            h_learner,
+            player_id=pid,
+            action_type=action_type,
+            raise_bucket=raise_bucket,
+            scalars=obs["scalars"],
+        )
+        if snapshots and _is_transformer(snapshots[0]):
+            h_opp = _push_if_transformer(
+                snapshots[0],
+                h_opp,
+                player_id=pid,
+                action_type=action_type,
+                raise_bucket=raise_bucket,
+                scalars=obs["scalars"],
+            )
         term = next_obs["terminated"].to(dtype=torch.bool)
         if term.any():
             bb = next_obs["big_blind"].to(dtype=torch.float32)
@@ -520,6 +580,24 @@ def eval_vs_policy(
 
         next_obs = env.step(action_type, amounts)
 
+        # Push public action tokens for transformer policies before resetting terminated envs.
+        h0 = _push_if_transformer(
+            policy_p0,
+            h0,
+            player_id=pid,
+            action_type=action_type,
+            raise_bucket=raise_bucket,
+            scalars=obs["scalars"],
+        )
+        h1 = _push_if_transformer(
+            policy_p1,
+            h1,
+            player_id=pid,
+            action_type=action_type,
+            raise_bucket=raise_bucket,
+            scalars=obs["scalars"],
+        )
+
         term = next_obs["terminated"].to(dtype=torch.bool)
         if term.any():
             bb = next_obs["big_blind"].to(dtype=torch.float32)
@@ -545,4 +623,58 @@ def eval_vs_policy(
         "bb_per_hand": float(bb_per_hand),
         "bb_per_100": float(bb_per_100),
         "hands": float(hands.item()),
+    }
+
+
+@torch.no_grad()
+def eval_vs_policy_duplicate(
+    *,
+    env: WarpPokerEnv,
+    policy_a: PokerPolicyNet | PokerTransformerPolicyNet,
+    policy_b: PokerPolicyNet | PokerTransformerPolicyNet,
+    target_hands: int,
+    max_steps: int = 0,
+    deterministic: bool = False,
+    seed: int = 0,
+) -> dict[str, float]:
+    """Seat-swapped duplicate-deck evaluation (identical deals played from both seats).
+
+    Plays `target_hands` hands with (policy_a=P0, policy_b=P1) and repeats the exact
+    same RNG deals and buttons with (policy_b=P0, policy_a=P1), cancelling card-luck
+    variance by ~3-5x compared to independent seat-swapped rollouts.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(int(seed))
+    seeds = rng.integers(0, 2**32, size=env.num_envs, dtype=np.uint32)
+    buttons = (np.arange(env.num_envs, dtype=np.int32) & 1).astype(np.int32)
+
+    env.seed_rng(seeds, buttons=buttons)
+    m_a = eval_vs_policy(
+        env=env,
+        policy_p0=policy_a,
+        policy_p1=policy_b,
+        target_hands=target_hands,
+        max_steps=max_steps,
+        deterministic=deterministic,
+    )
+    env.seed_rng(seeds, buttons=buttons)
+    m_b = eval_vs_policy(
+        env=env,
+        policy_p0=policy_b,
+        policy_p1=policy_a,
+        target_hands=target_hands,
+        max_steps=max_steps,
+        deterministic=deterministic,
+    )
+    bb_p0 = float(m_a["bb_per_hand"])
+    bb_p1 = -float(m_b["bb_per_hand"])
+    bb_avg = 0.5 * (bb_p0 + bb_p1)
+    total_hands = float(m_a["hands"] + m_b["hands"])
+    return {
+        "bb_per_hand": bb_avg,
+        "bb_per_100": bb_avg * 100.0,
+        "bb_per_hand_p0": bb_p0,
+        "bb_per_hand_p1": bb_p1,
+        "hands": total_hands,
     }

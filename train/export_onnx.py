@@ -133,26 +133,13 @@ class ExportableTransformerPolicy(nn.Module):
         h: torch.Tensor,  # [1, B, STATE_WIDTH] float32 (packed)
         c: torch.Tensor,  # [1, B, STATE_WIDTH] float32 (unused, passthrough)
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Unpack the per-env token table + length from the float32 packed
-        # state. Round-trip is exact at our small int vocab sizes.
         tokens, lengths = self.net.unpack_state(h)
-
-        # Mirror _forward_latent without the Categorical wrappers (those
-        # don't export cleanly to ONNX -- sampling stays in JS).
-        hist_emb = self.net._embed_history(tokens)  # [B, MAX_TOKENS, D]
-        cur_tok = self.net._build_current_token(cards, scalars).unsqueeze(1)
-        x = torch.cat([cur_tok, hist_emb], dim=1)
-        x = x + self.net.pos_enc.to(x.dtype).unsqueeze(0)
-
-        batch_size = cards.shape[0]
-        device = cards.device
-        pos = torch.arange(self.net.max_tokens, device=device).unsqueeze(0)
-        hist_pad = pos >= lengths.to(dtype=torch.int64).unsqueeze(1)
-        cur_pad = torch.zeros((batch_size, 1), device=device, dtype=torch.bool)
-        key_padding_mask = torch.cat([cur_pad, hist_pad], dim=1)
-
-        y = self.net.encoder(x, mask=None, src_key_padding_mask=key_padding_mask)
-        last = y[:, 0, :]  # [B, D] -- output at the current-state token
+        last, _ = self.net.encode_state(
+            cards=cards,
+            scalars=scalars,
+            tokens=tokens,
+            lengths=lengths,
+        )
 
         # Same action-masking logic as the LSTM wrapper: ensure FOLD is
         # always available as a fallback when no action is masked in.

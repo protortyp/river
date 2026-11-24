@@ -140,6 +140,87 @@ def get_obs_legal_kernel(
 
 
 @wp.kernel
+def get_obs_legal_opp_kernel(
+    game_state: GameState,
+    obs_cards: wp.array(dtype=wp.int32, ndim=2),
+    obs_opp_cards: wp.array(dtype=wp.int32, ndim=2),
+    obs_scalars: wp.array(dtype=wp.float32, ndim=2),
+    action_mask: wp.array(dtype=wp.bool, ndim=2),
+    min_raise: wp.array(dtype=wp.int32),
+    max_raise: wp.array(dtype=wp.int32),
+):
+    env_idx = wp.tid()
+    observations.write_observation(
+        game_state,
+        env_idx,
+        obs_cards,
+        obs_scalars,
+    )
+    opp = 1 - game_state.active_player[env_idx]
+    obs_opp_cards[env_idx, 0] = game_state.hole_cards[env_idx, opp, 0]
+    obs_opp_cards[env_idx, 1] = game_state.hole_cards[env_idx, opp, 1]
+    legal_actions.write_legal_actions(game_state, env_idx, action_mask, min_raise, max_raise)
+
+
+@wp.kernel
+def step_and_obs_kernel_per_env(
+    game_state: GameState,
+    action_types: wp.array(dtype=wp.int32),
+    amounts: wp.array(dtype=wp.int32),
+    rewards: wp.array(dtype=wp.float32),
+    dones: wp.array(dtype=wp.bool),
+    invalid_action: wp.array(dtype=wp.bool),
+    terminated: wp.array(dtype=wp.bool),
+    obs_cards: wp.array(dtype=wp.int32, ndim=2),
+    obs_opp_cards: wp.array(dtype=wp.int32, ndim=2),
+    obs_scalars: wp.array(dtype=wp.float32, ndim=2),
+    action_mask: wp.array(dtype=wp.bool, ndim=2),
+    min_raise: wp.array(dtype=wp.int32),
+    max_raise: wp.array(dtype=wp.int32),
+    primes: wp.array(dtype=wp.int32),
+    unsuited_lut: wp.array(dtype=wp.int16),
+    flush_lut: wp.array(dtype=wp.int16),
+    starting_stack: wp.array(dtype=wp.int32),
+    small_blind: wp.array(dtype=wp.int32),
+    big_blind: wp.array(dtype=wp.int32),
+):
+    """Fused step + observation + legal-actions kernel (single launch per step)."""
+    env_idx = wp.tid()
+
+    prev_episode = game_state.episode_id[env_idx]
+    action_type = action_types[env_idx]
+    action_amount = amounts[env_idx]
+
+    player = game_state.active_player[env_idx]
+    packed = actions.force_legal_action(game_state, env_idx, player, action_type, action_amount)
+    invalid_action[env_idx] = actions.unpack_invalid(packed)
+    action_type = actions.unpack_action_type(packed)
+    action_amount = actions.unpack_amount(packed)
+
+    rewards[env_idx] = state.step(
+        game_state,
+        env_idx,
+        action_type,
+        action_amount,
+        primes,
+        unsuited_lut,
+        flush_lut,
+        starting_stack[env_idx],
+        small_blind[env_idx],
+        big_blind[env_idx],
+    )
+
+    terminated[env_idx] = game_state.episode_id[env_idx] != prev_episode
+    dones[env_idx] = game_state.done[env_idx]
+
+    observations.write_observation(game_state, env_idx, obs_cards, obs_scalars)
+    opp = 1 - game_state.active_player[env_idx]
+    obs_opp_cards[env_idx, 0] = game_state.hole_cards[env_idx, opp, 0]
+    obs_opp_cards[env_idx, 1] = game_state.hole_cards[env_idx, opp, 1]
+    legal_actions.write_legal_actions(game_state, env_idx, action_mask, min_raise, max_raise)
+
+
+@wp.kernel
 def clear_step_flags_kernel(
     invalid_action: wp.array(dtype=wp.bool),
     terminated: wp.array(dtype=wp.bool),
@@ -202,6 +283,7 @@ class WarpPokerEnv:
         # 3. Create Zero-Copy Tensor Views
         # These are what we return to PyTorch
         self.obs_cards = wp.zeros((num_envs, 7), dtype=wp.int32, device=device)
+        self.obs_opp_cards = wp.zeros((num_envs, 2), dtype=wp.int32, device=device)
         self.obs_scalars = wp.zeros((num_envs, 17), dtype=wp.float32, device=device)
         self.rewards = wp.zeros(num_envs, dtype=wp.float32, device=device)
         self.dones = wp.zeros(num_envs, dtype=wp.bool, device=device)
@@ -365,11 +447,12 @@ class WarpPokerEnv:
         )
 
         wp.launch(
-            kernel=get_obs_legal_kernel,
+            kernel=get_obs_legal_opp_kernel,
             dim=self.num_envs,
             inputs=[
                 self.state,
                 self.obs_cards,
+                self.obs_opp_cards,
                 self.obs_scalars,
                 self.action_mask,
                 self.min_raise,
@@ -380,6 +463,7 @@ class WarpPokerEnv:
 
         return {
             "cards": wp.to_torch(self.obs_cards),
+            "opp_cards": wp.to_torch(self.obs_opp_cards),
             "scalars": wp.to_torch(self.obs_scalars),
             "action_mask": wp.to_torch(self.action_mask),
             "min_raise": wp.to_torch(self.min_raise),
@@ -395,6 +479,29 @@ class WarpPokerEnv:
                 + wp.to_torch(self.state.bets).sum(dim=-1).to(dtype=torch.int32)
             ),
         }
+
+    def seed_rng(
+        self,
+        seeds: np.ndarray | torch.Tensor,
+        *,
+        buttons: np.ndarray | torch.Tensor | None = None,
+    ) -> None:
+        """Set per-env RNG seeds (and optional initial buttons) for reproducible/duplicate deals."""
+        if isinstance(seeds, torch.Tensor):
+            seeds_np = seeds.detach().cpu().numpy().astype(np.uint32, copy=False)
+        else:
+            seeds_np = np.asarray(seeds, dtype=np.uint32)
+        if seeds_np.shape != (self.num_envs,):
+            raise ValueError(f"Expected seeds shape ({self.num_envs},), got {seeds_np.shape}")
+        wp.copy(self.state.rng_state, wp.array(seeds_np, dtype=wp.uint32, device=self.device))
+        if buttons is not None:
+            if isinstance(buttons, torch.Tensor):
+                btn_np = buttons.detach().cpu().numpy().astype(np.int32, copy=False)
+            else:
+                btn_np = np.asarray(buttons, dtype=np.int32)
+            if btn_np.shape != (self.num_envs,):
+                raise ValueError(f"Expected buttons shape ({self.num_envs},), got {btn_np.shape}")
+            wp.copy(self.state.button, wp.array(btn_np, dtype=wp.int32, device=self.device))
 
     def reset_with_config(
         self,
@@ -454,15 +561,22 @@ class WarpPokerEnv:
         wp.copy(self.amounts, wp.from_torch(amounts_torch, dtype=wp.int32))
 
         wp.launch(
-            kernel=step_kernel_per_env,
+            kernel=step_and_obs_kernel_per_env,
             dim=self.num_envs,
             inputs=[
                 self.state,
                 self.actions,
                 self.amounts,
                 self.rewards,
+                self.dones,
                 self.invalid_action,
                 self.terminated,
+                self.obs_cards,
+                self.obs_opp_cards,
+                self.obs_scalars,
+                self.action_mask,
+                self.min_raise,
+                self.max_raise,
                 self.primes,
                 self.unsuited_lut,
                 self.flush_lut,
@@ -473,24 +587,9 @@ class WarpPokerEnv:
             device=self.device,
         )
 
-        wp.launch(
-            kernel=get_obs_legal_kernel,
-            dim=self.num_envs,
-            inputs=[
-                self.state,
-                self.obs_cards,
-                self.obs_scalars,
-                self.action_mask,
-                self.min_raise,
-                self.max_raise,
-            ],
-            device=self.device,
-        )
-
-        wp.copy(self.dones, self.state.done)
-
         return {
             "cards": wp.to_torch(self.obs_cards),
+            "opp_cards": wp.to_torch(self.obs_opp_cards),
             "scalars": wp.to_torch(self.obs_scalars),
             "rewards": wp.to_torch(self.rewards),
             "dones": wp.to_torch(self.dones),
@@ -519,15 +618,22 @@ class WarpPokerEnv:
         and other advanced usage. If the buffers are stale/uninitialized, behavior is undefined.
         """
         wp.launch(
-            kernel=step_kernel_per_env,
+            kernel=step_and_obs_kernel_per_env,
             dim=self.num_envs,
             inputs=[
                 self.state,
                 self.actions,
                 self.amounts,
                 self.rewards,
+                self.dones,
                 self.invalid_action,
                 self.terminated,
+                self.obs_cards,
+                self.obs_opp_cards,
+                self.obs_scalars,
+                self.action_mask,
+                self.min_raise,
+                self.max_raise,
                 self.primes,
                 self.unsuited_lut,
                 self.flush_lut,
@@ -538,24 +644,9 @@ class WarpPokerEnv:
             device=self.device,
         )
 
-        wp.launch(
-            kernel=get_obs_legal_kernel,
-            dim=self.num_envs,
-            inputs=[
-                self.state,
-                self.obs_cards,
-                self.obs_scalars,
-                self.action_mask,
-                self.min_raise,
-                self.max_raise,
-            ],
-            device=self.device,
-        )
-
-        wp.copy(self.dones, self.state.done)
-
         return {
             "cards": wp.to_torch(self.obs_cards),
+            "opp_cards": wp.to_torch(self.obs_opp_cards),
             "scalars": wp.to_torch(self.obs_scalars),
             "rewards": wp.to_torch(self.rewards),
             "dones": wp.to_torch(self.dones),

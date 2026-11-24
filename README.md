@@ -41,19 +41,25 @@ out = env.step(actions)
 ## Training
 
 ```bash
+# Regularized Nash Dynamics (R-NaD) + suit-canonical Card-Token Transformer + CTDE critic
+uv run python train/train.py --config-name=train_rnad
+
+# AlphaStar Triad (Main + Main Exploiter + League Exploiter)
+uv run python train/train.py --config-name=train_triad_v100
+
 # Single-agent self-play / league PPO
 uv run python train/train.py
 
-# AlphaStar Triad (Main + Main Exploiter + League Exploiter) with Transformer backbone
-uv run python train/train.py --config-name=train_triad_v100
-
 # Override any Hydra parameter on the CLI
-uv run python train/train.py device=cpu num_envs=384 rollout_steps=4 total_env_steps=3072 triad_enabled=true policy_backbone=transformer
+uv run python train/train.py --config-name=train_rnad device=cpu num_envs=64 rollout_steps=8 total_env_steps=1024
 ```
 
 ## Evaluation & Play
 
 ```bash
+# Measure empirical best-response exploitability (duplicate-deck bb/100)
+uv run python train/exploitability.py --checkpoint checkpoints/rnad/rnad_final.pt --updates 100 --eval-hands 10000
+
 # Export a trained checkpoint to ONNX (LSTM or Transformer, verified against PyTorch)
 uv run python train/export_onnx.py --checkpoint path/to/ckpt.pt --out model.onnx
 
@@ -84,7 +90,7 @@ cd web && npm ci && npm run dev
 
 ```bash
 just check      # ruff lint + format check + ty type check
-just test       # pytest suite (170 tests)
+just test       # pytest suite (176 tests)
 just test-web   # JS encoder/engine parity + onnxruntime-web load/forward tests
 just bench      # GPU environment benchmark
 ```

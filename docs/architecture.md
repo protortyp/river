@@ -26,17 +26,14 @@
 Both backbones output a masked 4-way action distribution, a 7-way discrete pot-fraction raise distribution (`min-raise, 0.5p, 0.75p, 1.0p, 1.5p, 2.5p, all-in`), and a scalar value estimate:
 
 - **LSTM (`src/gpu_poker/policy.py`):** card embeddings + scalar MLP + pre-LSTM torso + per-seat LSTM `(h, c)` + post-LSTM MLP heads.
-- **Transformer (`src/gpu_poker/policy_transformer.py`):** encoder-only Transformer with current observation at position `0` and up to `MAX_TOKENS=32` public-action 4-tuples `(player, action, bucket, stage)` at positions `1..32`, packed into `[1, B, 129]` float32 so rollout buffers stay backbone-agnostic.
+- **Transformer (`src/gpu_poker/policy_transformer.py`):** encoder-only Transformer over `[1 scalar query, 7 factored card tokens, 32 public-action tokens]` with branchless **48× suit-isomorphism + hole-order canonicalization** baked into the model (identical in PyTorch, ONNX, and browser), packed history state `[1, B, 129]`, and an optional training-only **CTDE omniscient critic** (`omniscient_value_head`) conditioned on `obs["opp_cards"]` to cut advantage variance without inference leakage.
 
 ## 3. Training Stack (`train/`)
 
-- **Single-net (`train/single_runner.py`):** pure self-play PPO (GAE) or NFSP-lite league PPO (MC returns, `UnifiedOpponentPool` + PFSP).
-- **AlphaStar Triad (`train/triad_runner.py` + `train/triad.py`):** partitions `num_envs` (default `60/20/20`) across three independent networks and optimizers:
-  - **Main (M):** self-play + PFSP over historical pool + forgotten-opponent mix; snapshots periodically.
-  - **Main Exploiter (ME):** trains against live Main (falling back to variance-PFSP curriculum if win rate drops below threshold); snapshots when beating Main and resets to Main (plus periodic forced reset to prevent stalling).
-  - **League Exploiter (LE):** trains against all non-LE league snapshots; snapshots when beating all evaluated targets and probabilistically reinitializes.
-  - Periodic seat-swapped stochastic eval updates PFSP scores in `UnifiedOpponentPool` and enforces per-role snapshot pool caps.
-  - Three-file per-role checkpoints (`triad_env*_upd*_index.json`) preserve diverged M/ME/LE weights, optimizers, and snapshot metadata across resumes.
+- **R-NaD (`train/rnad_runner.py`, `conf/train_rnad.yaml`):** DeepNash-style Regularized Nash Dynamics with strictly zero-sum reward transform (`r - eta * log(pi / pi_reg)`), periodic anchor updates, CTDE omniscient critic, and duplicate-deck evaluation.
+- **AlphaStar Triad (`train/triad_runner.py` + `train/triad.py`):** partitions `num_envs` (default `60/20/20`) across three independent networks and optimizers (Main, Main Exploiter, League Exploiter) with duplicate-deck eval, PFSP score updates, per-role FIFO pool pruning, and 3-file checkpoint save/resume.
+- **Single-net (`train/single_runner.py`):** pure self-play PPO (GAE) or NFSP-lite league PPO (MC returns).
+- **Exploitability (`train/exploitability.py`):** trains a fresh best-response Transformer against any frozen checkpoint and reports duplicate-deck `bb/100` / `mbb/g` exploitability.
 
 ## 4. ONNX Export & Web Parity
 
