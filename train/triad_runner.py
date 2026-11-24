@@ -15,7 +15,7 @@ from gpu_poker.env import WarpPokerEnv
 from gpu_poker.policy import raise_bucket_to_amount
 from train.checkpointing import CheckpointState, save_checkpoint
 from train.config import TrainConfig, TrainResult, normalize_cfg_paths, resolve_amp
-from train.eval import eval_vs_policy
+from train.eval import eval_vs_policy_duplicate
 from train.league import OpponentMeta, UnifiedOpponentPool
 from train.policy_factory import (
     PolicyNet,
@@ -78,28 +78,21 @@ def _eval_seat_swapped(
     target_hands: int,
     max_steps: int,
 ) -> tuple[float, float, float, int]:
-    """Seat-swapped stochastic eval returning (bb_avg, bb_p0, bb_p1, total_hands)."""
-    m_a = eval_vs_policy(
+    """Duplicate-deck seat-swapped stochastic eval returning (bb_avg, bb_p0, bb_p1, total_hands)."""
+    m = eval_vs_policy_duplicate(
         env=eval_env,
-        policy_p0=policy_a,
-        policy_p1=policy_b,
+        policy_a=policy_a,
+        policy_b=policy_b,
         target_hands=target_hands,
         max_steps=max_steps,
         deterministic=False,
     )
-    bb_a = float(m_a.get("bb_per_hand", 0.0))
-    hands_a = int(m_a.get("hands", 0))
-    m_b = eval_vs_policy(
-        env=eval_env,
-        policy_p0=policy_b,
-        policy_p1=policy_a,
-        target_hands=target_hands,
-        max_steps=max_steps,
-        deterministic=False,
+    return (
+        float(m["bb_per_hand"]),
+        float(m["bb_per_hand_p0"]),
+        float(m["bb_per_hand_p1"]),
+        int(m["hands"]),
     )
-    bb_b = -float(m_b.get("bb_per_hand", 0.0))
-    hands_b = int(m_b.get("hands", 0))
-    return 0.5 * (bb_a + bb_b), bb_a, bb_b, hands_a + hands_b
 
 
 def _bb_to_wr(bb_per_hand: float) -> float:
