@@ -24,7 +24,9 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +51,9 @@ from gpu_poker.search import (  # noqa: E402
     COMBO_C1,
     BeliefTracker,
     RiverDCFRSolver,
+    RiverSubgameSession,
     combo_id,
+    pseudo_harmonic_bucket_weights,
     unblocked_combo_indices,
 )
 
@@ -607,8 +611,10 @@ class OnnxPolicy:
         history: list[tuple[int, int, int, int]],
         taken_action: int,
         taken_bucket: int,
+        bucket_weights: list[tuple[int, float]] | None = None,
     ) -> np.ndarray:
         """Compute `P(taken_action, taken_bucket | combo)` for all combos via canonical dedup."""
+        bw = bucket_weights if bucket_weights else [(int(taken_bucket), 1.0)]
         is_preflop_full = (
             self.is_transformer and len(board) == 0 and len(combo_indices) == len(COMBO_C0)
         )
@@ -619,7 +625,7 @@ class OnnxPolicy:
                 tuple(bool(x) for x in action_mask_1d.tolist()),
                 tuple(history),
                 int(taken_action),
-                int(taken_bucket),
+                tuple((b, round(w, 4)) for b, w in bw),
             )
             cached = self._preflop_cache.get(cache_key)
             if cached is not None:
@@ -675,7 +681,10 @@ class OnnxPolicy:
             rb_shift = rb_logits - rb_logits.max(axis=1, keepdims=True)
             rb_exp = np.exp(rb_shift)
             rb_probs = rb_exp / np.maximum(rb_exp.sum(axis=1, keepdims=True), 1e-12)
-            p_act = p_act * rb_probs[:, int(taken_bucket)]
+            p_bkt = np.zeros_like(p_act)
+            for b_idx, b_w in bw:
+                p_bkt += float(b_w) * rb_probs[:, int(b_idx)]
+            p_act = p_act * p_bkt
 
         res = p_act[inv].astype(np.float32) if inv is not None else p_act.astype(np.float32)
         if cache_key is not None and len(self._preflop_cache) < 512:
@@ -770,8 +779,10 @@ class TorchPolicy:
         history: list[tuple[int, int, int, int]],
         taken_action: int,
         taken_bucket: int,
+        bucket_weights: list[tuple[int, float]] | None = None,
     ) -> np.ndarray:
         torch = self.torch
+        bw = bucket_weights if bucket_weights else [(int(taken_bucket), 1.0)]
         is_preflop_full = (
             self.is_transformer and len(board) == 0 and len(combo_indices) == len(COMBO_C0)
         )
@@ -782,7 +793,7 @@ class TorchPolicy:
                 tuple(bool(x) for x in action_mask_1d.tolist()),
                 tuple(history),
                 int(taken_action),
-                int(taken_bucket),
+                tuple((b, round(w, 4)) for b, w in bw),
             )
             cached = self._preflop_cache.get(cache_key)
             if cached is not None:
@@ -826,18 +837,40 @@ class TorchPolicy:
             c_t = torch.zeros(
                 (1, n_eval, self.state_width), device=self.device, dtype=torch.float32
             )
-            act_t = torch.full((n_eval,), int(taken_action), device=self.device, dtype=torch.int64)
-            bkt_t = torch.full((n_eval,), int(taken_bucket), device=self.device, dtype=torch.int64)
-            eo = self.net.evaluate_step(  # type: ignore[operator]
-                cards=cards_t,
-                scalars=scalars_t,
-                action_mask=mask_t,
-                action_type=act_t,
-                raise_bucket=bkt_t,
-                h=h_t,
-                c=c_t,
-            )
-            p_act = torch.exp(eo.logprob.to(dtype=torch.float32)).cpu().numpy()
+            if int(taken_action) == const.ACTION_RAISE and len(bw) > 1:
+                p_acc = torch.zeros((n_eval,), device=self.device, dtype=torch.float32)
+                act_t = torch.full(
+                    (n_eval,), int(taken_action), device=self.device, dtype=torch.int64
+                )
+                for b_idx, b_w in bw:
+                    bkt_t = torch.full((n_eval,), int(b_idx), device=self.device, dtype=torch.int64)
+                    eo = self.net.evaluate_step(  # type: ignore[operator]
+                        cards=cards_t,
+                        scalars=scalars_t,
+                        action_mask=mask_t,
+                        action_type=act_t,
+                        raise_bucket=bkt_t,
+                        h=h_t,
+                        c=c_t,
+                    )
+                    p_acc = p_acc + float(b_w) * torch.exp(eo.logprob.to(dtype=torch.float32))
+                p_act = p_acc.cpu().numpy()
+            else:
+                b_single = bw[0][0] if bw else int(taken_bucket)
+                act_t = torch.full(
+                    (n_eval,), int(taken_action), device=self.device, dtype=torch.int64
+                )
+                bkt_t = torch.full((n_eval,), int(b_single), device=self.device, dtype=torch.int64)
+                eo = self.net.evaluate_step(  # type: ignore[operator]
+                    cards=cards_t,
+                    scalars=scalars_t,
+                    action_mask=mask_t,
+                    action_type=act_t,
+                    raise_bucket=bkt_t,
+                    h=h_t,
+                    c=c_t,
+                )
+                p_act = torch.exp(eo.logprob.to(dtype=torch.float32)).cpu().numpy()
 
         res = p_act[inv].astype(np.float32) if inv is not None else p_act.astype(np.float32)
         if cache_key is not None and len(self._preflop_cache) < 512:
@@ -856,9 +889,8 @@ def compute_river_beliefs(
 ) -> BeliefTracker:
     """Replay public history through `policy` to compute Bayesian ranges for both seats.
 
-    On postflop streets, combos whose current reach weight is below
-    `min_weight_ratio * mean_active_weight` are skipped during batched ONNX
-    inference (while keeping `keep_combo`), cutting turn/river inference cost.
+    Uses Ganzfried & Sandholm pseudo-harmonic action translation for off-tree bets and
+    skips negligible postflop combos (`< min_weight_ratio * mean`) while preserving `keep_combo`.
     """
     bt = BeliefTracker(smoothing=5e-4)
     st = HUNLState(button=button, hero_seat=0, hole_cards_hero=[0, 1])
@@ -879,6 +911,7 @@ def compute_river_beliefs(
         stage = st.stage
         obs_pub = encode_obs(st)
         active_combos = unblocked_combo_indices(cur_board)
+        bucket_weights: list[tuple[int, float]] | None = None
 
         if tok == "f":
             act, bkt, delta = const.ACTION_FOLD, 0, 0
@@ -894,9 +927,10 @@ def compute_river_beliefs(
             delta = max(0, target_total - st.bets[p] - tc)
             _, min_r, max_r = st.legal_actions()
             pot_total = st.pot + st.bets[0] + st.bets[1]
-            bkt = amount_to_nearest_bucket(
+            bucket_weights = pseudo_harmonic_bucket_weights(
                 delta, pot_total=pot_total, min_raise=min_r, max_raise=max_r
             )
+            bkt = max(bucket_weights, key=lambda pair: pair[1])[0]
             act = const.ACTION_RAISE
         else:
             continue
@@ -920,6 +954,7 @@ def compute_river_beliefs(
             history=history,
             taken_action=act,
             taken_bucket=bkt,
+            bucket_weights=bucket_weights,
         )
         bt.update_action(p, lik, active_indices=eval_combos)
         history.append((p, act, bkt, stage))
@@ -968,18 +1003,53 @@ def _board_per_street(board_strs: list[str]) -> list[list[int]]:
 # ---------------------------------------------------------------------------
 
 
+def _river_actions_from_str(
+    button: int, action_str: str, board_per_street: list[list[int]]
+) -> list[tuple[int, int, int]]:
+    """Return `[(player_id, action_type, chip_delta), ...]` for river-street tokens only."""
+    st = HUNLState(button=button, hero_seat=0, hole_cards_hero=[0, 1])
+    tokens = parse_action_tokens(action_str)
+    cur_street = 0
+    out: list[tuple[int, int, int]] = []
+    for street_idx, tok in tokens:
+        while cur_street < street_idx:
+            cur_street += 1
+            if cur_street < len(board_per_street):
+                st.reveal_board(board_per_street[cur_street])
+        p = st.active_player
+        if tok == "f":
+            act, delta = const.ACTION_FOLD, 0
+        elif tok == "k":
+            act, delta = const.ACTION_CHECK, 0
+        elif tok == "c":
+            act = const.ACTION_CHECK if st.to_call(p) == 0 else const.ACTION_CALL
+            delta = 0
+        elif tok.startswith("b") or tok.startswith("r"):
+            target_total = int(tok[1:])
+            delta = max(0, target_total - st.bets[p] - st.to_call(p))
+            act = const.ACTION_RAISE
+        else:
+            continue
+        if st.stage == const.STAGE_RIVER:
+            out.append((p, act, delta))
+        st.apply(act, amount=delta)
+    return out
+
+
 def run(
     model_path: str | None = None,
     n_hands: int = 1000,
     deterministic: bool = True,
     verbose: bool = False,
     river_search: bool = False,
-    search_iters: int = 100,
+    search_iters: int = 150,
     search_max_raises: int = 2,
+    search_device: str = "cpu",
     intra_threads: int = 0,
     checkpoint_path: str | None = None,
     config_path: str | None = None,
     device: str = "cpu",
+    workers: int = 1,
 ) -> None:
     policy: OnnxPolicy | TorchPolicy
     if checkpoint_path is not None:
@@ -994,210 +1064,252 @@ def run(
     else:
         raise ValueError("Provide either --model (ONNX) or --checkpoint (PyTorch)")
     solver = (
-        RiverDCFRSolver(bet_fractions=(0.5, 1.0), max_raises=search_max_raises)
+        RiverDCFRSolver(
+            bet_fractions=(0.33, 0.75, 1.5) if search_device.startswith("cuda") else (0.5, 1.0),
+            max_raises=search_max_raises,
+            device=search_device,
+        )
         if river_search
         else None
     )
-    s = requests.Session()
+
+    infer_lock = threading.Lock()
+    stats_lock = threading.Lock()
+    t0 = time.perf_counter()
 
     chip_total = 0
     hands_played = 0
     errored_hands = 0
-    deltas: list[int] = []
-    t0 = time.perf_counter()
-    token = ""
     river_solves = 0
+    river_reuses = 0
+    deltas: list[int] = []
 
-    for hand_i in range(n_hands):
-        data = slumbot_new_hand(s, token)
-        if "error_msg" in data or "hole_cards" not in data:
-            token = ""
-            data = slumbot_new_hand(s, "")
-        token = data.get("token", token)
-        # Slumbot's `client_pos` indicates which seat the client is in. Empirically
-        # (from observed action histories starting with a villain action when
-        # client_pos=0): client_pos=0 means hero is BB; client_pos=1 means hero
-        # is on the button (SB). Hero is always player 0 in our local state.
-        client_pos = int(data.get("client_pos", 0))
-        hero_seat = 0
-        button = 1 if client_pos == 0 else 0  # 0 = hero on button, 1 = villain on button
-        hole = [str_to_card(c) for c in data["hole_cards"]]
-        board = data.get("board", [])
-        action_str = data.get("action", "")
+    def _play_worker(worker_hands: int, worker_id: int) -> None:
+        nonlocal chip_total, hands_played, errored_hands, river_solves, river_reuses
+        s = requests.Session()
+        token = ""
 
-        state = HUNLState(
-            button=button,
-            hero_seat=hero_seat,
-            hole_cards_hero=hole,
-        )
-        policy.reset_state()
-        hand_errored = False
-
-        try:
-            hist = replay_history(state, action_str, _board_per_street(board))
-            policy.set_transformer_history(hist)
-        except Exception as e:
-            print(f"[hand {hand_i}] replay failed on initial state: {e}")
-            print(f"  action={action_str!r} board={board} hole={data['hole_cards']}")
-            errored_hands += 1
-            token = ""
-            continue
-
-        # Loop: while it's our turn, act. Then poll Slumbot for next state.
-        while not state.done:
-            # Slumbot signals end-of-hand by including "winnings". Check FIRST,
-            # because the terminal state can have any active_player.
-            if "winnings" in data and data.get("winnings") is not None:
-                state.done = True
-                state.reward_hero = int(data["winnings"])
-                break
-            # If it's not our turn at this point, something is off — Slumbot
-            # should only return state when it's hero's action.
-            if state.active_player != hero_seat:
-                print(
-                    f"[hand {hand_i}] WARNING: replay left active={state.active_player} "
-                    f"hero={hero_seat} action={action_str!r} raw={data}"
-                )
-                hand_errored = True
-                token = ""
-                break
-
-            obs = encode_obs(state)
-            used_search = False
-            amount = 0
-            if solver is not None and state.stage == const.STAGE_RIVER and len(board) == 5:
-                try:
-                    bps = _board_per_street(board)
-                    hero_cid = combo_id(hole[0], hole[1])
-                    bt = compute_river_beliefs(
-                        policy=policy,
-                        button=button,
-                        action_str=action_str,
-                        board_per_street=bps,
-                        keep_combo=hero_cid,
-                    )
-                    res = solver.solve(
-                        board=bps[3],
-                        pot=state.pot,
-                        stacks=(state.stacks[0], state.stacks[1]),
-                        bets=(state.bets[0], state.bets[1]),
-                        active_player=state.active_player,
-                        range_p0=bt.ranges[0],
-                        range_p1=bt.ranges[1],
-                        actions_taken=state.actions_this_street,
-                        raises_taken=state.num_raises,
-                        last_raise=state.last_raise,
-                        big_blind=state.bb_chips,
-                        iterations=search_iters,
-                        prune_eps=1e-4,
-                        keep_combo=hero_cid,
-                    )
-                    probs = res.action_probs_for_hand(hole)
-                    probs = probs / max(1e-12, float(probs.sum()))
-                    if deterministic:
-                        chosen_idx = int(np.argmax(probs))
-                    else:
-                        chosen_idx = int(np.random.choice(len(probs), p=probs))
-                    action_type, amount = res.actions[chosen_idx]
-                    used_search = True
-                    river_solves += 1
-                except Exception as e:
-                    print(f"[hand {hand_i}] river_search fallback: {e}")
-
-            if not used_search:
-                action_type, raise_bucket = policy.act(obs)
-                mask, min_d, max_d = state.legal_actions()
-                # Slumbot forbids folding when checking is free (to_call == 0); checking
-                # strictly dominates folding in that state.
-                if action_type == const.ACTION_FOLD and mask[const.ACTION_CHECK]:
-                    action_type = const.ACTION_CHECK
-                if not mask[action_type]:
-                    if mask[const.ACTION_CHECK]:
-                        action_type = const.ACTION_CHECK
-                    elif mask[const.ACTION_CALL]:
-                        action_type = const.ACTION_CALL
-                    else:
-                        action_type = const.ACTION_FOLD
-
-                if action_type == const.ACTION_RAISE:
-                    amount = bucket_to_amount(
-                        raise_bucket,
-                        pot_total=int(obs["pot_total"]),
-                        min_raise=int(obs["min_raise"]),
-                        max_raise=int(obs["max_raise"]),
-                    )
-                    if verbose:
-                        print(
-                            f"  raise: bucket={raise_bucket} -> delta={amount} "
-                            f"(pot={int(obs['pot_total'])}, min={min_d}, max={max_d})"
-                        )
-
-            incr = format_action_for_slumbot(state, action_type, amount)
-            if verbose:
-                print(f"  hero acts: {incr}")
-            # Apply locally first so our state machine stays in sync, then send.
-            state.apply(action_type, amount=amount)
+        for local_i in range(worker_hands):
+            hand_tag = f"w{worker_id}:{local_i}" if workers > 1 else str(local_i)
             try:
-                data = slumbot_act(s, token, incr)
-            except requests.HTTPError as e:
-                print(f"[hand {hand_i}] HTTP error from Slumbot: {e}")
-                hand_errored = True
+                data = slumbot_new_hand(s, token)
+                if "error_msg" in data or "hole_cards" not in data:
+                    token = ""
+                    data = slumbot_new_hand(s, "")
+            except requests.RequestException as e:
+                print(f"[hand {hand_tag}] HTTP error on new_hand: {e}")
+                with stats_lock:
+                    errored_hands += 1
                 token = ""
-                break
+                continue
 
-            if "error_msg" in data:
-                print(
-                    f"[hand {hand_i}] Slumbot error on incr={incr!r} "
-                    f"(prev_action={action_str!r}): {data['error_msg']}"
-                )
-                hand_errored = True
-                token = ""
-                break
-
-            # New state from Slumbot.
-            action_str = data.get("action", "")
+            token = data.get("token", token)
+            client_pos = int(data.get("client_pos", 0))
+            hero_seat = 0
+            button = 1 if client_pos == 0 else 0
+            hole = [str_to_card(c) for c in data["hole_cards"]]
             board = data.get("board", [])
-            if "winnings" in data:
-                # Resolve via Slumbot's authoritative winnings (chips for hero).
-                delta = int(data["winnings"])
-                state.done = True
-                state.reward_hero = delta
-                # Don't bother re-replaying the final villain actions; we trust Slumbot.
-                break
-            state = HUNLState(button=button, hero_seat=hero_seat, hole_cards_hero=hole)
+            action_str = data.get("action", "")
+
+            state = HUNLState(
+                button=button,
+                hero_seat=hero_seat,
+                hole_cards_hero=hole,
+            )
+            hand_errored = False
+            river_session: RiverSubgameSession | None = None
+            river_tokens_seen = 0
+
             try:
                 hist = replay_history(state, action_str, _board_per_street(board))
-                policy.set_transformer_history(hist)
             except Exception as e:
-                print(f"[hand {hand_i}] mid-hand replay failed: {e}")
-                hand_errored = True
+                print(f"[hand {hand_tag}] replay failed on initial state: {e}")
+                with stats_lock:
+                    errored_hands += 1
                 token = ""
-                break
+                continue
 
-        if hand_errored:
-            errored_hands += 1
-            continue
+            while not state.done:
+                if "winnings" in data and data.get("winnings") is not None:
+                    state.done = True
+                    state.reward_hero = int(data["winnings"])
+                    break
+                if state.active_player != hero_seat:
+                    print(
+                        f"[hand {hand_tag}] WARNING: replay left active={state.active_player} "
+                        f"hero={hero_seat} action={action_str!r} raw={data}"
+                    )
+                    hand_errored = True
+                    token = ""
+                    break
 
-        # Slumbot's "winnings" field is the chip delta for the client.
-        delta = data.get("winnings", state.reward_hero) if data else state.reward_hero
-        chip_total += int(delta)
-        hands_played += 1
-        deltas.append(int(delta))
+                obs = encode_obs(state)
+                used_search = False
+                amount = 0
+                if solver is not None and state.stage == const.STAGE_RIVER and len(board) == 5:
+                    try:
+                        bps = _board_per_street(board)
+                        hero_cid = combo_id(hole[0], hole[1])
+                        riv_acts = _river_actions_from_str(button, action_str, bps)
+                        with infer_lock:
+                            if river_session is None:
+                                bt = compute_river_beliefs(
+                                    policy=policy,
+                                    button=button,
+                                    action_str=action_str,
+                                    board_per_street=bps,
+                                    keep_combo=hero_cid,
+                                )
+                                river_session = RiverSubgameSession(
+                                    solver=solver,
+                                    board=bps[3],
+                                    range_p0=bt.ranges[0],
+                                    range_p1=bt.ranges[1],
+                                    big_blind=state.bb_chips,
+                                    iterations=search_iters,
+                                    prune_eps=1e-4,
+                                    keep_combo=hero_cid,
+                                )
+                                river_tokens_seen = len(riv_acts)
+                            else:
+                                for _pid, v_act, v_delta in riv_acts[river_tokens_seen:]:
+                                    river_session.observe_action(v_act, v_delta)
+                                river_tokens_seen = len(riv_acts)
 
-        if verbose or (hand_i + 1) % 50 == 0:
-            elapsed = time.perf_counter() - t0
-            mean_chips = chip_total / max(1, hands_played)
-            bb_per_100 = (mean_chips / SLUMBOT_BB) * 100.0
-            arr = np.array(deltas, dtype=np.float64) / SLUMBOT_BB * 100.0
-            se = float(arr.std(ddof=1) / math.sqrt(max(1, len(arr)))) if len(arr) > 1 else 0.0
-            print(
-                f"[{hand_i + 1}/{n_hands}] elapsed={elapsed:.1f}s "
-                f"bb/100={bb_per_100:+.2f} ± {se:.2f}"
-            )
+                            prev_solves = river_session.solves_run
+                            action_type, amount = river_session.act(
+                                pot=state.pot,
+                                stacks=(state.stacks[0], state.stacks[1]),
+                                bets=(state.bets[0], state.bets[1]),
+                                active_player=state.active_player,
+                                actions_taken=state.actions_this_street,
+                                raises_taken=state.num_raises,
+                                last_raise=state.last_raise,
+                                hole_cards=hole,
+                                deterministic=deterministic,
+                            )
+                            new_solve = river_session.solves_run > prev_solves
+                        river_tokens_seen += 1
+                        used_search = True
+                        with stats_lock:
+                            if new_solve:
+                                river_solves += 1
+                            else:
+                                river_reuses += 1
+                    except Exception as e:
+                        print(f"[hand {hand_tag}] river_search fallback: {e}")
+
+                if not used_search:
+                    with infer_lock:
+                        policy.reset_state()
+                        policy.set_transformer_history(hist)
+                        action_type, raise_bucket = policy.act(obs)
+                    mask, min_d, max_d = state.legal_actions()
+                    # Slumbot forbids folding when checking is free (to_call == 0); checking
+                    # strictly dominates folding in that state.
+                    if action_type == const.ACTION_FOLD and mask[const.ACTION_CHECK]:
+                        action_type = const.ACTION_CHECK
+                    if not mask[action_type]:
+                        if mask[const.ACTION_CHECK]:
+                            action_type = const.ACTION_CHECK
+                        elif mask[const.ACTION_CALL]:
+                            action_type = const.ACTION_CALL
+                        else:
+                            action_type = const.ACTION_FOLD
+
+                    if action_type == const.ACTION_RAISE:
+                        amount = bucket_to_amount(
+                            raise_bucket,
+                            pot_total=int(obs["pot_total"]),
+                            min_raise=int(obs["min_raise"]),
+                            max_raise=int(obs["max_raise"]),
+                        )
+                        if verbose:
+                            print(
+                                f"  raise: bucket={raise_bucket} -> delta={amount} "
+                                f"(pot={int(obs['pot_total'])}, min={min_d}, max={max_d})"
+                            )
+
+                incr = format_action_for_slumbot(state, action_type, amount)
+                if verbose:
+                    print(f"  hero acts: {incr}")
+                state.apply(action_type, amount=amount)
+                try:
+                    data = slumbot_act(s, token, incr)
+                except requests.RequestException as e:
+                    print(f"[hand {hand_tag}] HTTP error from Slumbot: {e}")
+                    hand_errored = True
+                    token = ""
+                    break
+
+                if "error_msg" in data:
+                    print(
+                        f"[hand {hand_tag}] Slumbot error on incr={incr!r} "
+                        f"(prev_action={action_str!r}): {data['error_msg']}"
+                    )
+                    hand_errored = True
+                    token = ""
+                    break
+
+                action_str = data.get("action", "")
+                board = data.get("board", [])
+                if "winnings" in data:
+                    state.done = True
+                    state.reward_hero = int(data["winnings"])
+                    break
+                state = HUNLState(button=button, hero_seat=hero_seat, hole_cards_hero=hole)
+                try:
+                    hist = replay_history(state, action_str, _board_per_street(board))
+                except Exception as e:
+                    print(f"[hand {hand_tag}] mid-hand replay failed: {e}")
+                    hand_errored = True
+                    token = ""
+                    break
+
+            if hand_errored:
+                with stats_lock:
+                    errored_hands += 1
+                continue
+
+            delta = data.get("winnings", state.reward_hero) if data else state.reward_hero
+            with stats_lock:
+                chip_total += int(delta)
+                hands_played += 1
+                deltas.append(int(delta))
+                done_n = hands_played
+                if verbose or done_n % 50 == 0:
+                    elapsed = time.perf_counter() - t0
+                    mean_chips = chip_total / max(1, done_n)
+                    bb_per_100 = (mean_chips / SLUMBOT_BB) * 100.0
+                    mbb_g = (mean_chips / SLUMBOT_BB) * 1000.0
+                    arr = np.array(deltas, dtype=np.float64) / SLUMBOT_BB * 100.0
+                    se_bb = (
+                        float(arr.std(ddof=1) / math.sqrt(max(1, len(arr))))
+                        if len(arr) > 1
+                        else 0.0
+                    )
+                    print(
+                        f"[{done_n}/{n_hands}] elapsed={elapsed:.1f}s "
+                        f"bb/100={bb_per_100:+.2f} ± {se_bb:.2f} "
+                        f"({mbb_g:+.1f} ± {se_bb * 10.0:.1f} mbb/g)",
+                        flush=True,
+                    )
+
+    n_workers = max(1, int(workers))
+    if n_workers == 1:
+        _play_worker(n_hands, 0)
+    else:
+        base_q, rem = divmod(n_hands, n_workers)
+        counts = [base_q + (1 if i < rem else 0) for i in range(n_workers)]
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futs = [pool.submit(_play_worker, cnt, i) for i, cnt in enumerate(counts) if cnt > 0]
+            for f in futs:
+                f.result()
 
     elapsed = time.perf_counter() - t0
     mean_chips = chip_total / max(1, hands_played)
     bb_per_100 = (mean_chips / SLUMBOT_BB) * 100.0
+    mbb_g = (mean_chips / SLUMBOT_BB) * 1000.0
     arr = np.array(deltas, dtype=np.float64) / SLUMBOT_BB * 100.0
     se = float(arr.std(ddof=1) / math.sqrt(max(1, len(arr)))) if len(arr) > 1 else 0.0
     print()
@@ -1206,10 +1318,11 @@ def run(
     ci_lo = bb_per_100 - 1.96 * se
     ci_hi = bb_per_100 + 1.96 * se
     print(f"bb/100:          {bb_per_100:+.3f} ± {se:.3f}  (95% CI: {ci_lo:+.2f} .. {ci_hi:+.2f})")
+    print(f"mbb/g:           {mbb_g:+.1f} ± {se * 10.0:.1f}")
     if errored_hands:
         print(f"errored hands skipped: {errored_hands}")
     if river_search:
-        print(f"river DCFR solves: {river_solves}")
+        print(f"river DCFR solves: {river_solves} (cached tree reuses: {river_reuses})")
 
 
 def main() -> int:
@@ -1233,10 +1346,22 @@ def main() -> int:
     p.add_argument(
         "--river-search",
         action="store_true",
-        help="Solve river spots online with Bayesian belief tracking + DCFR subgame solving.",
+        help="Solve river spots online with Bayesian beliefs + nested DCFR subgame solving.",
     )
-    p.add_argument("--search-iters", type=int, default=100, help="DCFR iterations per river solve.")
+    p.add_argument("--search-iters", type=int, default=150, help="DCFR iterations per river solve.")
     p.add_argument("--search-max-raises", type=int, default=2, help="Max raises in river subgame.")
+    p.add_argument(
+        "--search-device",
+        type=str,
+        default="cpu",
+        help="Device for RiverDCFRSolver ('cpu' NumPy or 'cuda:0' PyTorch GPU).",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Concurrent Slumbot HTTP worker sessions (e.g. 4 for ~4x faster eval).",
+    )
     p.add_argument(
         "--threads",
         type=int,
@@ -1253,10 +1378,12 @@ def main() -> int:
         river_search=bool(args.river_search),
         search_iters=int(args.search_iters),
         search_max_raises=int(args.search_max_raises),
+        search_device=str(args.search_device),
         intra_threads=int(args.threads),
         checkpoint_path=args.checkpoint,
         config_path=args.config,
         device=str(args.device),
+        workers=int(args.workers),
     )
     return 0
 

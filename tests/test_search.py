@@ -212,3 +212,98 @@ def test_disjoint_mass_matches_dense_matrix_and_slumbot_river_action_lookup():
     act_type, amt = res.actions[int(np.argmax(probs))]
     incr = format_action_for_slumbot(st, act_type, amt)
     assert incr == "k" or incr.startswith("b")
+
+
+def test_pseudo_harmonic_translation_and_nested_river_session():
+    from gpu_poker.search import RiverSubgameSession, pseudo_harmonic_bucket_weights
+
+    # Exact bucket match (0.5 * 1000 = 500 -> bucket 1) returns weight 1.0.
+    w_exact = pseudo_harmonic_bucket_weights(500, pot_total=1000, min_raise=100, max_raise=5000)
+    assert w_exact == [(1, 1.0)]
+
+    # Off-tree 0.6p (600 between 0.5p=500 and 0.75p=750) returns exact pseudo-harmonic split.
+    w_mid = pseudo_harmonic_bucket_weights(600, pot_total=1000, min_raise=100, max_raise=5000)
+    assert len(w_mid) == 2
+    assert w_mid[0][0] == 1 and w_mid[1][0] == 2
+    assert abs(w_mid[0][1] + w_mid[1][1] - 1.0) < 1e-6
+    # Expected P(0.5) = ((0.75 - 0.6) * 1.5) / ((0.75 - 0.5) * 1.6) = 0.225 / 0.40 = 0.5625
+    assert abs(w_mid[0][1] - 0.5625) < 1e-6
+
+    # Nested RiverSubgameSession: reuses cached solved tree on in-tree villain bet,
+    # and re-solves cleanly on off-tree villain bet.
+    board = [_card("2", "c"), _card("3", "d"), _card("7", "h"), _card("8", "s"), _card("J", "c")]
+    nuts = [_card("A", "h"), _card("A", "s")]
+    air = [_card("4", "c"), _card("5", "d")]
+    catcher = [_card("Q", "h"), _card("Q", "s")]
+    r0 = np.zeros(NUM_COMBOS, dtype=np.float32)
+    r0[combo_id(*nuts)] = 0.5
+    r0[combo_id(*air)] = 0.5
+    r1 = np.zeros(NUM_COMBOS, dtype=np.float32)
+    r1[combo_id(*catcher)] = 1.0
+
+    solver = RiverDCFRSolver(bet_fractions=(1.0,), max_raises=2)
+    sess = RiverSubgameSession(
+        solver=solver,
+        board=board,
+        range_p0=r0,
+        range_p1=r1,
+        big_blind=10,
+        iterations=100,
+        prune_eps=0.0,
+        keep_combo=combo_id(*nuts),
+    )
+    # Turn 1: P0 acts -> triggers 1st solve.
+    act1, amt1 = sess.act(
+        pot=100,
+        stacks=(300, 300),
+        bets=(0, 0),
+        active_player=0,
+        actions_taken=0,
+        raises_taken=0,
+        last_raise=0,
+        hole_cards=nuts,
+        deterministic=True,
+    )
+    assert sess.solves_run == 1
+    assert act1 == c.ACTION_RAISE and amt1 in (100, 300)
+
+    # Villain makes an off-tree min-raise on a non-all-in bet -> triggers nested re-solve.
+    sess.current_node = sess.current_node  # keep tree state; test off-tree on fresh 100 bet
+    sess2 = RiverSubgameSession(
+        solver=RiverDCFRSolver(bet_fractions=(1.0,), max_raises=2),
+        board=board,
+        range_p0=r0,
+        range_p1=r1,
+        big_blind=10,
+        iterations=100,
+        prune_eps=0.0,
+        keep_combo=combo_id(*nuts),
+    )
+    a1, d1 = sess2.act(
+        pot=100,
+        stacks=(400, 400),
+        bets=(0, 0),
+        active_player=0,
+        actions_taken=0,
+        raises_taken=0,
+        last_raise=0,
+        hole_cards=nuts,
+        deterministic=True,
+    )
+    assert sess2.solves_run == 1 and a1 == c.ACTION_RAISE
+    # Simulate villain off-tree raise of +25 (neither call nor all-in) when chips remain.
+    bet_hero = min(d1, 100)
+    sess2.observe_action(c.ACTION_RAISE, delta=25)
+    act2, _amt2 = sess2.act(
+        pot=100,
+        stacks=(400 - bet_hero, 400 - bet_hero - 25),
+        bets=(bet_hero, bet_hero + 25),
+        active_player=0,
+        actions_taken=2,
+        raises_taken=2,
+        last_raise=25,
+        hole_cards=nuts,
+        deterministic=True,
+    )
+    assert sess2.solves_run == 2
+    assert act2 in (c.ACTION_CALL, c.ACTION_RAISE)
