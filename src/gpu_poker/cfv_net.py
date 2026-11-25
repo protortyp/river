@@ -144,8 +144,14 @@ class RiverCFVNet(nn.Module):
         rank_pct: torch.Tensor,
         valid_mask: torch.Tensor,
         spr: torch.Tensor,
+        active_idx: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Predict exact zero-sum pot-normalized `(cfv0, cfv1)` of shape `[B, 1326]`."""
+        """Predict exact zero-sum pot-normalized `(cfv0, cfv1)`.
+
+        When `active_idx` (`[H]` int64) is provided (containing all non-zero reach combos),
+        the per-combo residual trunk runs only on those `H` active combos — mathematically
+        identical to evaluating all 1,326 combos and slicing `[:, active_idx]` while ~3-4x faster.
+        """
         bsz = r0.shape[0]
         dtype = r0.dtype
         spr_f = spr.to(dtype=dtype).clamp_min(0.0)
@@ -225,43 +231,63 @@ class RiverCFVNet(nn.Module):
         g = self.global_norm(g)
         g_bias = self.global_to_combo(g).unsqueeze(1)  # [B, 1, hidden_dim]
         bin_table = self.global_to_bins(g).view(bsz, NUM_STRENGTH_BINS, self.bin_dim)
-        # Gather strength-tier embedding for every combo: [B, 1326, bin_dim].
-        gather_idx = bin_idx.unsqueeze(-1).expand(-1, -1, self.bin_dim)
+
+        # Slice to active combos before the per-combo residual trunk when requested.
+        if active_idx is not None:
+            r0_c = r0v[:, active_idx]
+            r1_c = r1v[:, active_idx]
+            ck0_c = ck0v[:, active_idx]
+            ck1_c = ck1v[:, active_idx]
+            pct_c = pctv[:, active_idx]
+            val_c = valid_mask[:, active_idx]
+            bin_c = bin_idx[:, active_idx]
+            blk_c = blocker_feats[:, active_idx, :]
+            raw_ck0_c = check_cfv0[:, active_idx]
+            raw_ck1_c = check_cfv1[:, active_idx]
+            raw_r0_c = r0[:, active_idx]
+            raw_r1_c = r1[:, active_idx]
+        else:
+            r0_c, r1_c, ck0_c, ck1_c, pct_c, val_c = r0v, r1v, ck0v, ck1v, pctv, valid_mask
+            bin_c, blk_c = bin_idx, blocker_feats
+            raw_ck0_c, raw_ck1_c, raw_r0_c, raw_r1_c = check_cfv0, check_cfv1, r0, r1
+
+        n_c = r0_c.shape[1]
+        gather_idx = bin_c.unsqueeze(-1).expand(-1, -1, self.bin_dim)
         combo_bin_ctx = torch.gather(bin_table, 1, gather_idx)
 
         # 3. Shared per-combo residual trunk (exact card-permutation equivariance).
-        r0_s = (r0v * 1081.0).clamp_max(20.0)
-        r1_s = (r1v * 1081.0).clamp_max(20.0)
+        r0_s = (r0_c * 1081.0).clamp_max(20.0)
+        r1_s = (r1_c * 1081.0).clamp_max(20.0)
         own_feats = torch.stack(
             [
                 r0_s,
                 r1_s,
-                torch.log1p(r0v * 1081.0),
-                torch.log1p(r1v * 1081.0),
-                ck0v,
-                ck1v,
-                pctv,
-                pctv * pctv,
+                torch.log1p(r0_c * 1081.0),
+                torch.log1p(r1_c * 1081.0),
+                ck0_c,
+                ck1_c,
+                pct_c,
+                pct_c * pct_c,
             ],
             dim=-1,
-        )  # [B, 1326, 8]
-        spr_b = spr_feats.unsqueeze(1).expand(-1, NUM_COMBOS, -1)  # [B, 1326, 4]
-        combo_x = torch.cat([own_feats, blocker_feats, spr_b, combo_bin_ctx], dim=-1)
+        )  # [B, H, 8]
+        spr_b = spr_feats.unsqueeze(1).expand(-1, n_c, -1)  # [B, H, 4]
+        combo_x = torch.cat([own_feats, blk_c, spr_b, combo_bin_ctx], dim=-1)
         h = self.combo_in(combo_x) + g_bias
         for blk in self.combo_blocks:
             h = blk(h)
-        delta = self.out_head(self.out_norm(h))  # [B, 1326, 2]
+        delta = self.out_head(self.out_norm(h))  # [B, H, 2]
         d0, d1 = delta[..., 0], delta[..., 1]
 
         # Exact boundary condition: when SPR == 0 (all-in), river betting delta is 0.
         spr_gate = (spr_f / (spr_f + 0.1)).unsqueeze(-1)
-        cfv0 = (check_cfv0 + spr_gate * d0) * valid_mask
-        cfv1 = (check_cfv1 + spr_gate * d1) * valid_mask
+        cfv0 = (raw_ck0_c + spr_gate * d0) * val_c
+        cfv1 = (raw_ck1_c + spr_gate * d1) * val_c
 
         # Exact zero-sum projection: r0 · cfv0 + r1 · cfv1 == 0 identically.
-        imbalance = (r0 * cfv0).sum(dim=-1) + (r1 * cfv1).sum(dim=-1)
-        mass = (r0.sum(dim=-1) + r1.sum(dim=-1)).clamp_min(1e-6)
-        shift = (imbalance / mass).unsqueeze(-1) * valid_mask
+        imbalance = (raw_r0_c * cfv0).sum(dim=-1) + (raw_r1_c * cfv1).sum(dim=-1)
+        mass = (raw_r0_c.sum(dim=-1) + raw_r1_c.sum(dim=-1)).clamp_min(1e-6)
+        shift = (imbalance / mass).unsqueeze(-1) * val_c
         cfv0 = cfv0 - shift
         cfv1 = cfv1 - shift
         return cfv0, cfv1

@@ -1113,6 +1113,7 @@ def run(
     log_jsonl: str | None = None,
     turn_max_spr: float = 1.5,
     river_max_spr: float | None = None,
+    turn_handoff: bool = False,
 ) -> None:
     policy: OnnxPolicy | TorchPolicy
     if checkpoint_path is not None:
@@ -1318,10 +1319,8 @@ def run(
                             button, action_str, bps, const.STAGE_RIVER
                         )
                         if river_session is None:
-                            if turn_session is not None:
-                                # Continual re-solving handoff: observe closing turn actions and
-                                # transfer Turn-solved ranges directly to the river without
-                                # re-running preflop/flop/turn blueprint beliefs.
+                            if turn_handoff and turn_session is not None:
+                                # Optional continual re-solving handoff from Turn DCFR ranges.
                                 turn_acts = _street_actions_from_str(
                                     button, action_str, bps, const.STAGE_TURN
                                 )
@@ -1334,9 +1333,10 @@ def run(
                                     keep_combo=hero_cid,
                                 )
                             else:
-                                # Compute beliefs at river entry (before Villain's river action)
-                                # so Villain's river check/bet is inferred under the exact Nash
-                                # river DCFR equilibrium rather than the raw blueprint.
+                                # Default: compute calibrated blueprint beliefs at river entry
+                                # so Turn DCFR leaf approximation noise cannot pollute exact
+                                # River DCFR ranges, while still inferring Villain's river bet
+                                # under the exact Nash river equilibrium.
                                 entry_action_str = "/".join(action_str.split("/")[:3])
                                 bt = compute_river_beliefs(
                                     policy=policy,
@@ -1671,6 +1671,11 @@ def main() -> int:
         default=None,
         help="Optional SPR cap suppressing river all-in branch (None keeps full all-in branch).",
     )
+    p.add_argument(
+        "--turn-handoff",
+        action="store_true",
+        help="Pass Turn DCFR ranges directly into River DCFR (default: fresh calibrated beliefs).",
+    )
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
     run(
@@ -1697,6 +1702,7 @@ def main() -> int:
         log_jsonl=args.log_jsonl,
         turn_max_spr=float(args.turn_max_spr),
         river_max_spr=args.river_max_spr,
+        turn_handoff=bool(args.turn_handoff),
     )
     return 0
 

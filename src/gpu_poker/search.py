@@ -659,9 +659,9 @@ class _TurnCFVLeafEvaluator:
                     rank_pct=self.pct_t,
                     valid_mask=self.valid_t,
                     spr=spr_t,
+                    active_idx=self.idx_t,
                 )
-            chosen = (p0 if update_player == 0 else p1).to(dtype=torch.float32)
-            vals_k = chosen[:, self.idx_t]  # [K, H]
+            vals_k = (p0 if update_player == 0 else p1).to(dtype=torch.float32)  # [K, H]
             # Scale each river card's normalized CFV by pot_leaf * opp_m and divide by the
             # expected number of mutually-unblocked river cards `k * (44 / 48)` (44 for all 48).
             weights = torch.where(opp_m > 1e-12, opp_m, torch.zeros_like(opp_m)) * (
@@ -1403,7 +1403,7 @@ class RiverSubgameSession:
             return
         best_idx, best_amt = min(raise_indices, key=lambda pair: abs(pair[1] - int(delta)))
         self._update_range_from_node(node, best_idx)
-        tol = max(self.big_blind // 2, int(0.08 * max(1, best_amt)))
+        tol = max(self.big_blind // 2, int(0.14 * max(1, best_amt)))
         if abs(best_amt - int(delta)) <= tol:
             ch = node.children[best_idx]
             self.current_node = ch if ch.kind == "decision" else None
