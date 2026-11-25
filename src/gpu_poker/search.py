@@ -683,6 +683,7 @@ class RiverDCFRSolver:
         device: str = "cpu",
         cfv_net: RiverCFVNet | None = None,
         turn_all_in_max_spr: float = 3.0,
+        river_all_in_max_spr: float | None = 2.5,
         cfv_sample_rivers: int | None = None,
     ) -> None:
         self.bet_fractions = tuple(float(f) for f in bet_fractions)
@@ -691,6 +692,9 @@ class RiverDCFRSolver:
         self.device = str(device)
         self.cfv_net = cfv_net
         self.turn_all_in_max_spr = float(turn_all_in_max_spr)
+        self.river_all_in_max_spr = (
+            None if river_all_in_max_spr is None else float(river_all_in_max_spr)
+        )
         if cfv_sample_rivers is None:
             self.cfv_sample_rivers = 48 if self.device.startswith("cuda") else 16
         else:
@@ -768,7 +772,7 @@ class RiverDCFRSolver:
             bet_fractions=self.bet_fractions,
             max_raises=self.max_raises,
             inv=(int(bets[0]), int(bets[1])),
-            all_in_max_spr=self.turn_all_in_max_spr if is_turn else None,
+            all_in_max_spr=self.turn_all_in_max_spr if is_turn else self.river_all_in_max_spr,
         )
 
         leaf_eval: _TurnCFVLeafEvaluator | None = None

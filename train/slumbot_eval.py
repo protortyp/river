@@ -1112,6 +1112,7 @@ def run(
     blueprint_min_prob: float = 0.05,
     log_jsonl: str | None = None,
     turn_max_spr: float = 1.5,
+    river_max_spr: float = 2.5,
 ) -> None:
     policy: OnnxPolicy | TorchPolicy
     if checkpoint_path is not None:
@@ -1153,6 +1154,7 @@ def run(
             bet_fractions=(0.33, 0.75, 1.5),
             max_raises=search_max_raises,
             device="cpu",
+            river_all_in_max_spr=river_max_spr,
         )
         if river_search
         else None
@@ -1660,6 +1662,12 @@ def main() -> int:
         default=1.5,
         help="Suppress turn all-in shove branch when remaining SPR exceeds this threshold.",
     )
+    p.add_argument(
+        "--river-max-spr",
+        type=float,
+        default=2.5,
+        help="Suppress river all-in overjam branch when remaining SPR exceeds this threshold.",
+    )
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
     run(
@@ -1685,6 +1693,7 @@ def main() -> int:
         blueprint_min_prob=float(args.blueprint_min_prob),
         log_jsonl=args.log_jsonl,
         turn_max_spr=float(args.turn_max_spr),
+        river_max_spr=float(args.river_max_spr),
     )
     return 0
 
