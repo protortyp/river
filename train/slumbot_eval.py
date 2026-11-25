@@ -1112,7 +1112,7 @@ def run(
     blueprint_min_prob: float = 0.05,
     log_jsonl: str | None = None,
     turn_max_spr: float = 1.5,
-    river_max_spr: float = 2.5,
+    river_max_spr: float | None = None,
 ) -> None:
     policy: OnnxPolicy | TorchPolicy
     if checkpoint_path is not None:
@@ -1333,39 +1333,15 @@ def run(
                                     iterations=search_iters,
                                     keep_combo=hero_cid,
                                 )
-                                if len(riv_acts) > 0:
-                                    # Villain acted first on the river: solve river entry tree once
-                                    # and observe Villain's action under exact river GTO ranges.
-                                    entry_res = river_solver.solve(
-                                        board=bps[3],
-                                        pot=state.pot,
-                                        stacks=(
-                                            state.stacks[0] + state.bets[0],
-                                            state.stacks[1] + state.bets[1],
-                                        ),
-                                        bets=(0, 0),
-                                        active_player=1 - button,
-                                        range_p0=river_session.ranges[0],
-                                        range_p1=river_session.ranges[1],
-                                        actions_taken=0,
-                                        raises_taken=0,
-                                        last_raise=0,
-                                        big_blind=state.bb_chips,
-                                        iterations=search_iters,
-                                        prune_eps=1e-4,
-                                        keep_combo=hero_cid,
-                                    )
-                                    river_session.solves_run += 1
-                                    river_session.current_node = entry_res.root_node
-                                    river_session.combo_indices = entry_res.combo_indices
-                                    for _pid, v_act, v_delta in riv_acts:
-                                        river_session.observe_action(v_act, v_delta)
-                                river_tokens_seen = len(riv_acts)
                             else:
+                                # Compute beliefs at river entry (before Villain's river action)
+                                # so Villain's river check/bet is inferred under the exact Nash
+                                # river DCFR equilibrium rather than the raw blueprint.
+                                entry_action_str = "/".join(action_str.split("/")[:3])
                                 bt = compute_river_beliefs(
                                     policy=policy,
                                     button=button,
-                                    action_str=action_str,
+                                    action_str=entry_action_str,
                                     board_per_street=bps,
                                     keep_combo=hero_cid,
                                 )
@@ -1380,7 +1356,34 @@ def run(
                                     keep_combo=hero_cid,
                                     hero_seat=hero_seat,
                                 )
-                                river_tokens_seen = len(riv_acts)
+                            if len(riv_acts) > 0:
+                                # Villain acted first on the river: solve river entry tree once
+                                # and observe Villain's action under exact Nash river ranges.
+                                entry_res = river_solver.solve(
+                                    board=bps[3],
+                                    pot=state.pot,
+                                    stacks=(
+                                        state.stacks[0] + state.bets[0],
+                                        state.stacks[1] + state.bets[1],
+                                    ),
+                                    bets=(0, 0),
+                                    active_player=1 - button,
+                                    range_p0=river_session.ranges[0],
+                                    range_p1=river_session.ranges[1],
+                                    actions_taken=0,
+                                    raises_taken=0,
+                                    last_raise=0,
+                                    big_blind=state.bb_chips,
+                                    iterations=search_iters,
+                                    prune_eps=1e-4,
+                                    keep_combo=hero_cid,
+                                )
+                                river_session.solves_run += 1
+                                river_session.current_node = entry_res.root_node
+                                river_session.combo_indices = entry_res.combo_indices
+                                for _pid, v_act, v_delta in riv_acts:
+                                    river_session.observe_action(v_act, v_delta)
+                            river_tokens_seen = len(riv_acts)
                         else:
                             for _pid, v_act, v_delta in riv_acts[river_tokens_seen:]:
                                 river_session.observe_action(v_act, v_delta)
@@ -1665,8 +1668,8 @@ def main() -> int:
     p.add_argument(
         "--river-max-spr",
         type=float,
-        default=2.5,
-        help="Suppress river all-in overjam branch when remaining SPR exceeds this threshold.",
+        default=None,
+        help="Optional SPR cap suppressing river all-in branch (None keeps full all-in branch).",
     )
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
@@ -1693,7 +1696,7 @@ def main() -> int:
         blueprint_min_prob=float(args.blueprint_min_prob),
         log_jsonl=args.log_jsonl,
         turn_max_spr=float(args.turn_max_spr),
-        river_max_spr=float(args.river_max_spr),
+        river_max_spr=args.river_max_spr,
     )
     return 0
 

@@ -683,7 +683,7 @@ class RiverDCFRSolver:
         device: str = "cpu",
         cfv_net: RiverCFVNet | None = None,
         turn_all_in_max_spr: float = 3.0,
-        river_all_in_max_spr: float | None = 2.5,
+        river_all_in_max_spr: float | None = None,
         cfv_sample_rivers: int | None = None,
     ) -> None:
         self.bet_fractions = tuple(float(f) for f in bet_fractions)
