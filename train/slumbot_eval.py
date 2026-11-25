@@ -22,6 +22,7 @@ It does NOT use AIVAT yet (variance reduction comes later); expect SE around
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import threading
@@ -1109,6 +1110,8 @@ def run(
     log_every: int = 25,
     cfv_net_path: str | None = None,
     blueprint_min_prob: float = 0.05,
+    log_jsonl: str | None = None,
+    turn_max_spr: float = 1.5,
 ) -> None:
     policy: OnnxPolicy | TorchPolicy
     if checkpoint_path is not None:
@@ -1139,6 +1142,7 @@ def run(
             max_raises=turn_max_raises,
             device=search_device,
             cfv_net=cfv_net,
+            turn_all_in_max_spr=turn_max_spr,
             cfv_sample_rivers=cfv_rivers,
         )
         if turn_search
@@ -1167,6 +1171,11 @@ def run(
     river_reuses = 0
     deltas: list[int] = []
     street_deltas: dict[int, list[int]] = {0: [], 1: [], 2: [], 3: []}
+    log_fh = None
+    if log_jsonl is not None:
+        lp = Path(log_jsonl)
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = lp.open("a", encoding="utf-8")
 
     def _play_worker(worker_hands: int, worker_id: int) -> None:
         nonlocal chip_total, hands_played, errored_hands
@@ -1192,7 +1201,8 @@ def run(
             client_pos = int(data.get("client_pos", 0))
             hero_seat = 0
             button = 1 if client_pos == 0 else 0
-            hole = [str_to_card(c) for c in data["hole_cards"]]
+            hole_strs = list(data["hole_cards"])
+            hole = [str_to_card(c) for c in hole_strs]
             board = data.get("board", [])
             action_str = data.get("action", "")
 
@@ -1477,6 +1487,19 @@ def run(
                 deltas.append(int(delta))
                 street_deltas[end_street].append(int(delta))
                 done_n = hands_played
+                if log_fh is not None:
+                    rec = {
+                        "hand": done_n,
+                        "pos": "BTN" if button == 0 else "BB",
+                        "hole": hole_strs,
+                        "bot_hole": data.get("bot_hole_cards") if data else None,
+                        "board": board,
+                        "action": action_str,
+                        "winnings": int(delta),
+                        "end_street": end_street,
+                    }
+                    log_fh.write(json.dumps(rec) + "\n")
+                    log_fh.flush()
                 if verbose or done_n % max(1, int(log_every)) == 0:
                     elapsed = time.perf_counter() - t0
                     mean_chips = chip_total / max(1, done_n)
@@ -1496,15 +1519,21 @@ def run(
                     )
 
     n_workers = max(1, int(workers))
-    if n_workers == 1:
-        _play_worker(n_hands, 0)
-    else:
-        base_q, rem = divmod(n_hands, n_workers)
-        counts = [base_q + (1 if i < rem else 0) for i in range(n_workers)]
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futs = [pool.submit(_play_worker, cnt, i) for i, cnt in enumerate(counts) if cnt > 0]
-            for f in futs:
-                f.result()
+    try:
+        if n_workers == 1:
+            _play_worker(n_hands, 0)
+        else:
+            base_q, rem = divmod(n_hands, n_workers)
+            counts = [base_q + (1 if i < rem else 0) for i in range(n_workers)]
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futs = [
+                    pool.submit(_play_worker, cnt, i) for i, cnt in enumerate(counts) if cnt > 0
+                ]
+                for f in futs:
+                    f.result()
+    finally:
+        if log_fh is not None:
+            log_fh.close()
 
     elapsed = time.perf_counter() - t0
     mean_chips = chip_total / max(1, hands_played)
@@ -1619,6 +1648,18 @@ def main() -> int:
         default=25,
         help="Print running bb/100 + mbb/g progress every N hands.",
     )
+    p.add_argument(
+        "--log-jsonl",
+        type=str,
+        default=None,
+        help="Optional path to append per-hand JSONL records for reproducible audits.",
+    )
+    p.add_argument(
+        "--turn-max-spr",
+        type=float,
+        default=1.5,
+        help="Suppress turn all-in shove branch when remaining SPR exceeds this threshold.",
+    )
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
     run(
@@ -1642,6 +1683,8 @@ def main() -> int:
         log_every=int(args.log_every),
         cfv_net_path=args.cfv_net,
         blueprint_min_prob=float(args.blueprint_min_prob),
+        log_jsonl=args.log_jsonl,
+        turn_max_spr=float(args.turn_max_spr),
     )
     return 0
 
