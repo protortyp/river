@@ -142,6 +142,22 @@ def test_river_cfv_net_exact_card_permutation_equivariance():
     assert torch.allclose(p0[0], q0[0, combo_perm], atol=1e-5)
     assert torch.allclose(p1[0], q1[0, combo_perm], atol=1e-5)
 
+    # Active-combo slicing must match full 1,326 evaluation bit-for-bit on active combos.
+    active = torch.from_numpy(np.where(valid > 0.5)[0].astype(np.int64))
+    with torch.no_grad():
+        s0, s1 = net(
+            r0=torch.from_numpy(r0)[None],
+            r1=torch.from_numpy(r1)[None],
+            check_cfv0=torch.from_numpy(ck0)[None],
+            check_cfv1=torch.from_numpy(ck1)[None],
+            rank_pct=torch.from_numpy(pct)[None],
+            valid_mask=torch.from_numpy(valid)[None],
+            spr=torch.tensor([2.0]),
+            active_idx=active,
+        )
+    assert torch.allclose(s0[0], p0[0, active], atol=1e-5)
+    assert torch.allclose(s1[0], p1[0, active], atol=1e-5)
+
 
 def test_turn_dcfr_with_zero_init_cfv_net_matches_exact_checkdown_and_caps_deep_jams():
     """Zero-init RiverCFVNet equals exact checkdown equity -> Turn DCFR matches identically."""
