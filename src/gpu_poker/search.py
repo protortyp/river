@@ -596,12 +596,18 @@ class _TurnCFVLeafEvaluator:
 
         self.pct_t = torch.from_numpy(np.stack(pct_list, axis=0)).to(self.device)  # [K, 1326]
         self.valid_t = torch.from_numpy(np.stack(val_list, axis=0)).to(self.device)  # [K, 1326]
-        self.s_mats = s_list  # K matrices of [H, H]
-        self.alive_masks = alive_list  # K bool masks of [H]
-        self.alive_count = np.maximum(
-            1.0, np.sum(np.stack(alive_list, axis=0).astype(np.float32), axis=0)
-        )
+        self.s_stack_t = torch.from_numpy(np.stack(s_list, axis=0)).to(self.device)  # [K, H, H]
+        self.alive_t = torch.from_numpy(np.stack(alive_list, axis=0).astype(np.float32)).to(
+            self.device
+        )  # [K, H]
+        self.alive_unif_t = self.alive_t / self.alive_t.sum(dim=1, keepdim=True).clamp_min(1.0)
         self.idx_t = torch.from_numpy(combo_idx.astype(np.int64)).to(self.device)
+        k = len(self.river_cards)
+        self._r0_buf = torch.zeros((k, NUM_COMBOS), device=self.device, dtype=torch.float32)
+        self._r1_buf = torch.zeros((k, NUM_COMBOS), device=self.device, dtype=torch.float32)
+        self._ck0_buf = torch.zeros((k, NUM_COMBOS), device=self.device, dtype=torch.float32)
+        self._ck1_buf = torch.zeros((k, NUM_COMBOS), device=self.device, dtype=torch.float32)
+        self._use_bf16 = self.device.type == "cuda"
 
     def eval_leaf(
         self,
@@ -615,56 +621,54 @@ class _TurnCFVLeafEvaluator:
         """Return `[H]` counterfactual value vector for `update_player` at a deep Turn leaf."""
         torch = self.torch
         k = len(self.river_cards)
-        r0_full = np.zeros((k, NUM_COMBOS), dtype=np.float32)
-        r1_full = np.zeros((k, NUM_COMBOS), dtype=np.float32)
-        ck0_full = np.zeros((k, NUM_COMBOS), dtype=np.float32)
-        ck1_full = np.zeros((k, NUM_COMBOS), dtype=np.float32)
-        opp_mass = np.zeros(k, dtype=np.float32)
-
-        for i in range(k):
-            alive = self.alive_masks[i]
-            rr0 = np.where(alive, r0, 0.0)
-            rr1 = np.where(alive, r1, 0.0)
-            m0 = float(rr0.sum())
-            m1 = float(rr1.sum())
-            opp_m = m1 if update_player == 0 else m0
-            if opp_m <= 1e-12:
-                continue
-            # Even when the acting player's own reach on this river card is 0, counterfactual
-            # values for unblocked combos remain non-zero whenever opponent reach is positive.
-            if m0 > 1e-12:
-                r0_hat = rr0 / m0
-            else:
-                r0_hat = alive.astype(np.float32) / max(1.0, float(alive.sum()))
-            if m1 > 1e-12:
-                r1_hat = rr1 / m1
-            else:
-                r1_hat = alive.astype(np.float32) / max(1.0, float(alive.sum()))
-            r0_full[i, self.combo_idx] = r0_hat
-            r1_full[i, self.combo_idx] = r1_hat
-            ck0_full[i, self.combo_idx] = 0.5 * (self.s_mats[i] @ r1_hat)
-            ck1_full[i, self.combo_idx] = 0.5 * (self.s_mats[i] @ r0_hat)
-            opp_mass[i] = opp_m
-
         spr_val = float(eff_stack_left) / max(1.0, float(pot_leaf))
         with torch.no_grad():
-            p0, p1 = self.cfv_net(
-                r0=torch.from_numpy(r0_full).to(self.device),
-                r1=torch.from_numpy(r1_full).to(self.device),
-                check_cfv0=torch.from_numpy(ck0_full).to(self.device),
-                check_cfv1=torch.from_numpy(ck1_full).to(self.device),
-                rank_pct=self.pct_t,
-                valid_mask=self.valid_t,
-                spr=torch.full((k,), spr_val, device=self.device, dtype=torch.float32),
-            )
-            chosen = p0 if update_player == 0 else p1
-            vals_k = chosen[:, self.idx_t].cpu().numpy()  # [K, H]
+            r0_t = torch.from_numpy(r0).to(self.device)
+            r1_t = torch.from_numpy(r1).to(self.device)
+            rr0 = r0_t.unsqueeze(0) * self.alive_t  # [K, H]
+            rr1 = r1_t.unsqueeze(0) * self.alive_t  # [K, H]
+            m0 = rr0.sum(dim=1, keepdim=True)
+            m1 = rr1.sum(dim=1, keepdim=True)
+            opp_m = (m1 if update_player == 0 else m0).squeeze(1)  # [K]
+            if float(opp_m.max().item()) <= 1e-12:
+                return np.zeros(r0.shape[0], dtype=np.float32)
 
-        # Scale each river card's normalized CFV by pot_leaf * opp_mass[i] and divide by the
-        # expected number of mutually-unblocked river cards `k * (44 / 48)` (44 for all 48 cards).
-        denom = float(k) * (44.0 / 48.0)
-        weighted = vals_k * (opp_mass[:, None] * float(pot_leaf))
-        return (weighted.sum(axis=0) / denom).astype(np.float32)
+            # Even when the acting player's own reach on a river card is 0, counterfactual
+            # values for unblocked combos remain non-zero whenever opponent reach is positive.
+            r0_hat = torch.where(m0 > 1e-12, rr0 / m0.clamp_min(1e-12), self.alive_unif_t)
+            r1_hat = torch.where(m1 > 1e-12, rr1 / m1.clamp_min(1e-12), self.alive_unif_t)
+            ck0_h = 0.5 * torch.bmm(self.s_stack_t, r1_hat.unsqueeze(-1)).squeeze(-1)  # [K, H]
+            ck1_h = 0.5 * torch.bmm(self.s_stack_t, r0_hat.unsqueeze(-1)).squeeze(-1)  # [K, H]
+
+            self._r0_buf.zero_()
+            self._r1_buf.zero_()
+            self._ck0_buf.zero_()
+            self._ck1_buf.zero_()
+            self._r0_buf[:, self.idx_t] = r0_hat
+            self._r1_buf[:, self.idx_t] = r1_hat
+            self._ck0_buf[:, self.idx_t] = ck0_h
+            self._ck1_buf[:, self.idx_t] = ck1_h
+
+            spr_t = torch.full((k,), spr_val, device=self.device, dtype=torch.float32)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_bf16):
+                p0, p1 = self.cfv_net(
+                    r0=self._r0_buf,
+                    r1=self._r1_buf,
+                    check_cfv0=self._ck0_buf,
+                    check_cfv1=self._ck1_buf,
+                    rank_pct=self.pct_t,
+                    valid_mask=self.valid_t,
+                    spr=spr_t,
+                )
+            chosen = (p0 if update_player == 0 else p1).to(dtype=torch.float32)
+            vals_k = chosen[:, self.idx_t]  # [K, H]
+            # Scale each river card's normalized CFV by pot_leaf * opp_m and divide by the
+            # expected number of mutually-unblocked river cards `k * (44 / 48)` (44 for all 48).
+            weights = torch.where(opp_m > 1e-12, opp_m, torch.zeros_like(opp_m)) * (
+                float(pot_leaf) / (float(k) * (44.0 / 48.0))
+            )
+            out_t = (vals_k * weights.unsqueeze(1)).sum(dim=0)
+            return out_t.cpu().numpy().astype(np.float32)
 
 
 class RiverDCFRSolver:
@@ -679,7 +683,7 @@ class RiverDCFRSolver:
         device: str = "cpu",
         cfv_net: RiverCFVNet | None = None,
         turn_all_in_max_spr: float = 3.0,
-        cfv_sample_rivers: int = 12,
+        cfv_sample_rivers: int | None = None,
     ) -> None:
         self.bet_fractions = tuple(float(f) for f in bet_fractions)
         self.max_raises = int(max_raises)
@@ -687,7 +691,10 @@ class RiverDCFRSolver:
         self.device = str(device)
         self.cfv_net = cfv_net
         self.turn_all_in_max_spr = float(turn_all_in_max_spr)
-        self.cfv_sample_rivers = int(cfv_sample_rivers)
+        if cfv_sample_rivers is None:
+            self.cfv_sample_rivers = 48 if self.device.startswith("cuda") else 16
+        else:
+            self.cfv_sample_rivers = int(cfv_sample_rivers)
 
     def solve(
         self,
