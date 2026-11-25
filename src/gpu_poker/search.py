@@ -1288,11 +1288,20 @@ class BeliefTracker:
         player: int,
         action_likelihoods: np.ndarray,
         active_indices: np.ndarray | None = None,
+        *,
+        temper: float = 1.0,
+        smoothing: float | None = None,
     ) -> None:
-        """Apply exact Bayes update `r[h] *= P(a | h)` with small smoothing floor."""
+        """Apply tempered Bayes update `r[h] *= (P(a | h) + eps)^temper`.
+
+        Tempering (`temper < 1`, e.g. `0.35`, with `eps ~ 0.03`) prevents multi-street belief
+        collapse when an unknown opponent's action probabilities diverge from our blueprint.
+        """
         p = int(player)
-        lik = np.asarray(action_likelihoods, dtype=np.float32)
-        lik = np.clip(lik, 0.0, 1.0) + self.smoothing
+        eps = self.smoothing if smoothing is None else float(smoothing)
+        lik = np.clip(np.asarray(action_likelihoods, dtype=np.float32), 0.0, 1.0) + eps
+        if temper != 1.0:
+            lik = np.power(lik, float(temper)).astype(np.float32)
         if active_indices is None:
             self.ranges[p] *= lik
         else:
@@ -1321,6 +1330,9 @@ class RiverSubgameSession:
         iterations: int = 150,
         prune_eps: float = 1e-4,
         keep_combo: int | None = None,
+        hero_seat: int | None = None,
+        opp_temper: float = 0.45,
+        opp_smoothing: float = 0.02,
     ) -> None:
         self.solver = solver
         self.board = [int(x) for x in board]
@@ -1332,6 +1344,9 @@ class RiverSubgameSession:
         self.iterations = int(iterations)
         self.prune_eps = float(prune_eps)
         self.keep_combo = keep_combo
+        self.hero_seat = hero_seat
+        self.opp_temper = float(opp_temper)
+        self.opp_smoothing = float(opp_smoothing)
         self.current_node: _RiverNode | None = None
         self.combo_indices: np.ndarray | None = None
         self.solves_run: int = 0
@@ -1340,8 +1355,13 @@ class RiverSubgameSession:
         if node.strategy_sum is None or self.combo_indices is None:
             return
         strat = _average_strategy(node.strategy_sum)
-        lik = strat[action_idx] + 1e-4
         p = int(node.player)
+        if self.hero_seat is not None and p != int(self.hero_seat):
+            lik = np.power(
+                np.clip(strat[action_idx], 0.0, 1.0) + self.opp_smoothing, self.opp_temper
+            ).astype(np.float32)
+        else:
+            lik = strat[action_idx] + 1e-4
         updated = np.zeros_like(self.ranges[p])
         updated[self.combo_indices] = self.ranges[p][self.combo_indices] * lik
         s = float(updated.sum())
@@ -1485,4 +1505,7 @@ class RiverSubgameSession:
             iterations=self.iterations if iterations is None else int(iterations),
             prune_eps=self.prune_eps if prune_eps is None else float(prune_eps),
             keep_combo=self.keep_combo if keep_combo is None else keep_combo,
+            hero_seat=self.hero_seat,
+            opp_temper=self.opp_temper,
+            opp_smoothing=self.opp_smoothing,
         )

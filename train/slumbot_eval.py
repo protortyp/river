@@ -924,13 +924,18 @@ def compute_river_beliefs(
     board_per_street: list[list[int]],
     min_weight_ratio: float = 0.02,
     keep_combo: int | None = None,
+    hero_seat: int = 0,
+    opp_temper: float = 0.35,
+    opp_smoothing: float = 0.03,
 ) -> BeliefTracker:
     """Replay public history through `policy` to compute Bayesian ranges for both seats.
 
-    Uses Ganzfried & Sandholm pseudo-harmonic action translation for off-tree bets and
-    skips negligible postflop combos (`< min_weight_ratio * mean`) while preserving `keep_combo`.
+    Uses Ganzfried & Sandholm pseudo-harmonic action translation for off-tree bets,
+    tempered likelihoods on opponent actions (preventing multi-street belief collapse
+    against non-blueprint opponents), and skips negligible postflop combos while preserving
+    `keep_combo`.
     """
-    bt = BeliefTracker(smoothing=5e-4)
+    bt = BeliefTracker(smoothing=5e-3)
     st = HUNLState(button=button, hero_seat=0, hole_cards_hero=[0, 1])
     tokens = parse_action_tokens(action_str)
     current_street = 0
@@ -994,7 +999,16 @@ def compute_river_beliefs(
             taken_bucket=bkt,
             bucket_weights=bucket_weights,
         )
-        bt.update_action(p, lik, active_indices=eval_combos)
+        if p == int(hero_seat):
+            bt.update_action(p, lik, active_indices=eval_combos, temper=0.80, smoothing=5e-3)
+        else:
+            bt.update_action(
+                p,
+                lik,
+                active_indices=eval_combos,
+                temper=opp_temper,
+                smoothing=opp_smoothing,
+            )
         history.append((p, act, bkt, stage))
         st.apply(act, amount=delta)
 
@@ -1132,7 +1146,7 @@ def run(
     )
     river_solver = (
         RiverDCFRSolver(
-            bet_fractions=(0.5, 1.0),
+            bet_fractions=(0.33, 0.75, 1.5),
             max_raises=search_max_raises,
             device="cpu",
         )
@@ -1248,6 +1262,7 @@ def run(
                                 iterations=turn_iters,
                                 prune_eps=1e-4,
                                 keep_combo=hero_cid,
+                                hero_seat=hero_seat,
                             )
                             turn_tokens_seen = len(turn_acts)
                         else:
@@ -1351,6 +1366,7 @@ def run(
                                     iterations=search_iters,
                                     prune_eps=1e-4,
                                     keep_combo=hero_cid,
+                                    hero_seat=hero_seat,
                                 )
                                 river_tokens_seen = len(riv_acts)
                         else:
