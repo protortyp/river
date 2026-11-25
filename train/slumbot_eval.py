@@ -1443,6 +1443,20 @@ def run(
                                 f"(pot={int(obs['pot_total'])}, min={min_d}, max={max_d})"
                             )
 
+                mask, min_d, max_d = state.legal_actions()
+                if action_type == const.ACTION_FOLD and mask[const.ACTION_CHECK]:
+                    action_type = const.ACTION_CHECK
+                if not mask[action_type]:
+                    if mask[const.ACTION_CHECK]:
+                        action_type = const.ACTION_CHECK
+                    elif mask[const.ACTION_CALL]:
+                        action_type = const.ACTION_CALL
+                    else:
+                        action_type = const.ACTION_FOLD
+                    amount = 0
+                elif action_type == const.ACTION_RAISE:
+                    amount = max_d if max_d < min_d else max(min_d, min(max_d, int(amount)))
+
                 incr = format_action_for_slumbot(state, action_type, amount)
                 if verbose:
                     print(f"  hero acts: {incr}")
