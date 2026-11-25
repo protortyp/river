@@ -13,6 +13,7 @@ from gpu_poker.search import (
     BeliefTracker,
     RiverDCFRSolver,
     RiverHandEvaluator,
+    RiverSubgameSession,
     combo_id,
     unblocked_combo_indices,
 )
@@ -443,3 +444,77 @@ def test_midstreet_facing_overbet_exact_pot_odds_and_zero_sum():
     )
     pos2 = int(np.searchsorted(res_call.combo_indices, combo_id(*catcher)))
     assert float(res_call.strategy[call_idx, pos2]) > 0.99
+
+
+def test_river_subgame_session_clamps_offtree_cached_raise_to_legal_bounds() -> None:
+    """Off-tree villain bets matched to a cached template branch must yield legal raise deltas."""
+    # Board: 2c 7d 9h Js Kd; Hero holds As Ah (strong value hand that raises vs small bet).
+    board = [0, 18, 30, 39, 46]
+    hero = [51, 50]
+    nuts = [47, 45]  # Kc Kh
+    air = [4, 9]  # 3c 4d
+
+    r0 = np.zeros(NUM_COMBOS, dtype=np.float32)
+    r0[combo_id(*hero)] = 1.0
+    r1 = np.zeros(NUM_COMBOS, dtype=np.float32)
+    r1[combo_id(*air)] = 0.95
+    r1[combo_id(*nuts)] = 0.05
+
+    solver = RiverDCFRSolver(bet_fractions=(0.33, 0.75, 1.5), max_raises=3)
+    session = RiverSubgameSession(
+        solver=solver,
+        board=board,
+        range_p0=r0,
+        range_p1=r1,
+        big_blind=100,
+        iterations=30,
+        keep_combo=combo_id(*hero),
+        hero_seat=0,
+    )
+    # Solve river entry (pot=424, p1 acts first; 0.33p template bet = 140).
+    entry_res = solver.solve(
+        board=board,
+        pot=424,
+        stacks=(19788, 19788),
+        bets=(0, 0),
+        active_player=1,
+        range_p0=r0,
+        range_p1=r1,
+        actions_taken=0,
+        raises_taken=0,
+        last_raise=0,
+        big_blind=100,
+        iterations=30,
+        keep_combo=combo_id(*hero),
+    )
+    session.current_node = entry_res.root_node
+    session.combo_indices = entry_res.combo_indices
+
+    # Villain bets 188 (within 14% off-tree tolerance of 140 -> reuses template child where
+    # 0.33p raise delta is 186 < live min-raise 188).
+    session.observe_action(c.ACTION_RAISE, 188)
+    assert session.current_node is not None
+    # Force the template's smallest raise action (delta=186) to be picked deterministically.
+    node = session.current_node
+    assert node.strategy_sum is not None and session.combo_indices is not None
+    small_raise_idx = min(
+        (i for i, (a, _) in enumerate(node.actions) if a == c.ACTION_RAISE),
+        key=lambda i: node.actions[i][1],
+    )
+    assert node.actions[small_raise_idx][1] < 188
+    node.strategy_sum.fill(0.0)
+    node.strategy_sum[small_raise_idx, :] = 1.0
+
+    act_type, delta = session.act(
+        pot=424,
+        stacks=(19788, 19600),
+        bets=(0, 188),
+        active_player=0,
+        actions_taken=1,
+        raises_taken=1,
+        last_raise=188,
+        hole_cards=hero,
+        deterministic=True,
+    )
+    assert act_type == c.ACTION_RAISE
+    assert delta >= 188

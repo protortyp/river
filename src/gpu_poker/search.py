@@ -1470,6 +1470,23 @@ class RiverSubgameSession:
         self._update_range_from_node(node, chosen_idx)
         ch = node.children[chosen_idx]
         self.current_node = ch if ch.kind == "decision" else None
+        if act_type == c.ACTION_RAISE:
+            # Cached subtrees matched within off-tree tolerance can propose a raise
+            # delta calibrated to the template bet rather than the live chip state.
+            p = int(active_player)
+            opp = 1 - p
+            to_call = max(0, int(bets[opp]) - int(bets[p]))
+            eff_max_total = min(int(bets[0]) + int(stacks[0]), int(bets[1]) + int(stacks[1]))
+            max_delta = max(0, eff_max_total - (int(bets[p]) + to_call))
+            min_delta = max(self.big_blind, int(last_raise))
+            if max_delta <= 0 or int(stacks[p]) <= to_call:
+                act_type = c.ACTION_CALL if to_call > 0 else c.ACTION_CHECK
+                amount = 0
+                self.current_node = None
+            elif max_delta < min_delta:
+                amount = max_delta
+            else:
+                amount = max(min_delta, min(max_delta, int(amount)))
         return act_type, amount
 
     def handoff_to_river(
