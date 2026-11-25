@@ -1082,7 +1082,10 @@ def run(
     river_search: bool = False,
     turn_search: bool = False,
     search_iters: int = 150,
+    turn_iters: int = 45,
     search_max_raises: int = 2,
+    turn_max_raises: int = 1,
+    cfv_rivers: int | None = None,
     search_device: str = "cpu",
     intra_threads: int = 0,
     checkpoint_path: str | None = None,
@@ -1116,14 +1119,24 @@ def run(
         from gpu_poker.cfv_net import load_cfv_checkpoint
 
         cfv_net = load_cfv_checkpoint(cfv_net_path, device=search_device)
-    solver = (
+    turn_solver = (
         RiverDCFRSolver(
-            bet_fractions=(0.33, 0.75, 1.5) if search_device.startswith("cuda") else (0.5, 1.0),
-            max_raises=search_max_raises,
+            bet_fractions=(0.5, 1.0),
+            max_raises=turn_max_raises,
             device=search_device,
             cfv_net=cfv_net,
+            cfv_sample_rivers=cfv_rivers,
         )
-        if (river_search or turn_search)
+        if turn_search
+        else None
+    )
+    river_solver = (
+        RiverDCFRSolver(
+            bet_fractions=(0.5, 1.0),
+            max_raises=search_max_raises,
+            device="cpu",
+        )
+        if river_search
         else None
     )
 
@@ -1208,7 +1221,7 @@ def run(
                 amount = 0
                 if (
                     turn_search
-                    and solver is not None
+                    and turn_solver is not None
                     and state.stage == const.STAGE_TURN
                     and len(board) == 4
                 ):
@@ -1227,12 +1240,12 @@ def run(
                                 keep_combo=hero_cid,
                             )
                             turn_session = RiverSubgameSession(
-                                solver=solver,
+                                solver=turn_solver,
                                 board=bps[2],
                                 range_p0=bt.ranges[0],
                                 range_p1=bt.ranges[1],
                                 big_blind=state.bb_chips,
-                                iterations=search_iters,
+                                iterations=turn_iters,
                                 prune_eps=1e-4,
                                 keep_combo=hero_cid,
                             )
@@ -1267,7 +1280,7 @@ def run(
 
                 elif (
                     river_search
-                    and solver is not None
+                    and river_solver is not None
                     and state.stage == const.STAGE_RIVER
                     and len(board) == 5
                 ):
@@ -1289,13 +1302,14 @@ def run(
                                     turn_session.observe_action(v_act, v_delta)
                                 river_session = turn_session.handoff_to_river(
                                     river_card=bps[3][4],
-                                    river_solver=solver,
+                                    river_solver=river_solver,
+                                    iterations=search_iters,
                                     keep_combo=hero_cid,
                                 )
                                 if len(riv_acts) > 0:
                                     # Villain acted first on the river: solve river entry tree once
                                     # and observe Villain's action under exact river GTO ranges.
-                                    entry_res = solver.solve(
+                                    entry_res = river_solver.solve(
                                         board=bps[3],
                                         pot=state.pot,
                                         stacks=(
@@ -1329,7 +1343,7 @@ def run(
                                     keep_combo=hero_cid,
                                 )
                                 river_session = RiverSubgameSession(
-                                    solver=solver,
+                                    solver=river_solver,
                                     board=bps[3],
                                     range_p0=bt.ranges[0],
                                     range_p1=bt.ranges[1],
@@ -1549,8 +1563,16 @@ def main() -> int:
         action="store_true",
         help="Solve turn spots with exact 44-river-card DCFR + continual handoff to river.",
     )
-    p.add_argument("--search-iters", type=int, default=150, help="DCFR iterations per solve.")
-    p.add_argument("--search-max-raises", type=int, default=2, help="Max raises in subgame tree.")
+    p.add_argument("--search-iters", type=int, default=150, help="River DCFR iterations per solve.")
+    p.add_argument("--turn-iters", type=int, default=45, help="Turn DCFR iterations per solve.")
+    p.add_argument("--search-max-raises", type=int, default=2, help="Max raises in river tree.")
+    p.add_argument("--turn-max-raises", type=int, default=1, help="Max raises in turn tree.")
+    p.add_argument(
+        "--cfv-rivers",
+        type=int,
+        default=None,
+        help="River cards averaged per Turn CFV leaf (default: 48 on CUDA, 16 on CPU).",
+    )
     p.add_argument(
         "--search-device",
         type=str,
@@ -1591,7 +1613,10 @@ def main() -> int:
         river_search=bool(args.river_search),
         turn_search=bool(args.turn_search),
         search_iters=int(args.search_iters),
+        turn_iters=int(args.turn_iters),
         search_max_raises=int(args.search_max_raises),
+        turn_max_raises=int(args.turn_max_raises),
+        cfv_rivers=args.cfv_rivers,
         search_device=str(args.search_device),
         intra_threads=int(args.threads),
         checkpoint_path=args.checkpoint,
