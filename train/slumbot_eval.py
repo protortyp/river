@@ -1099,7 +1099,9 @@ def run(
     search_iters: int = 150,
     turn_iters: int = 45,
     search_max_raises: int = 2,
-    turn_max_raises: int = 1,
+    # At least 2 raises are required on turn so the solver models opponent check-raises/re-raises
+    # rather than over-betting into a truncated no-raise branch.
+    turn_max_raises: int = 2,
     cfv_rivers: int | None = None,
     search_device: str = "cpu",
     intra_threads: int = 0,
@@ -1630,7 +1632,12 @@ def main() -> int:
     p.add_argument("--search-iters", type=int, default=150, help="River DCFR iterations per solve.")
     p.add_argument("--turn-iters", type=int, default=45, help="Turn DCFR iterations per solve.")
     p.add_argument("--search-max-raises", type=int, default=2, help="Max raises in river tree.")
-    p.add_argument("--turn-max-raises", type=int, default=1, help="Max raises in turn tree.")
+    p.add_argument(
+        "--turn-max-raises",
+        type=int,
+        default=2,
+        help="Max raises in turn tree (minimum 2 recommended so opponent raises are modeled).",
+    )
     p.add_argument(
         "--cfv-rivers",
         type=int,
