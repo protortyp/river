@@ -334,3 +334,53 @@ def test_reset_terminated_zeros_state():
     assert torch.all(tokens[0] == 0)
     assert torch.all(tokens[2] == 0)
     assert torch.all(tokens[1] == 1)
+
+
+def test_aux_opp_card_loss_and_legacy_checkpoint_load():
+    """CTDE opponent hand-reading loss backprops into actor trunk and loads legacy state_dicts."""
+    torch.manual_seed(7)
+    net = PokerTransformerPolicyNet(scalar_dim=17, d_model=64, n_heads=4, n_layers=2, ffn_dim=128)
+    batch = 8
+    cards = torch.full((batch, 7), -1, dtype=torch.int32)
+    cards[:, 0] = torch.arange(batch, dtype=torch.int32)
+    cards[:, 1] = torch.arange(batch, dtype=torch.int32) + 13
+    cards[:, 2:5] = torch.tensor([[26, 27, 28]], dtype=torch.int32)
+    opp_cards = torch.stack(
+        [
+            torch.arange(batch, dtype=torch.int32) + 30,
+            torch.arange(batch, dtype=torch.int32) + 40,
+        ],
+        dim=1,
+    )
+    scalars = torch.randn(batch, 17)
+    mask = torch.ones((batch, constants.NUM_ACTIONS), dtype=torch.bool)
+    h, c = PokerTransformerPolicyNet.init_state(batch, 0, torch.device("cpu"))
+    at = torch.zeros(batch, dtype=torch.int64)
+    rb = torch.zeros(batch, dtype=torch.int64)
+
+    out_no_opp = net.evaluate_step(
+        cards=cards, scalars=scalars, action_mask=mask, action_type=at, raise_bucket=rb, h=h, c=c
+    )
+    assert out_no_opp.opp_card_loss is None
+
+    out_with_opp = net.evaluate_step(
+        cards=cards,
+        scalars=scalars,
+        action_mask=mask,
+        action_type=at,
+        raise_bucket=rb,
+        h=h,
+        c=c,
+        opp_cards=opp_cards,
+    )
+    assert out_with_opp.opp_card_loss is not None
+    assert torch.isfinite(out_with_opp.opp_card_loss)
+    assert float(out_with_opp.opp_card_loss.item()) > 0.0
+    out_with_opp.opp_card_loss.backward()
+    assert net.opp_card_head.weight.grad is not None
+    assert net.card_embed.weight.grad is not None
+
+    # Legacy checkpoints without opp_card_head.* must still load with strict=True.
+    legacy_sd = {k: v for k, v in net.state_dict().items() if not k.startswith("opp_card_head.")}
+    net2 = PokerTransformerPolicyNet(scalar_dim=17, d_model=64, n_heads=4, n_layers=2, ffn_dim=128)
+    net2.load_state_dict(legacy_sd, strict=True)
