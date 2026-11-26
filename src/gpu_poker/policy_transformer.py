@@ -49,6 +49,7 @@ class PolicyOutput:
     h: torch.Tensor
     c: torch.Tensor
     decentralized_value: torch.Tensor | None = None
+    opp_card_loss: torch.Tensor | None = None
 
 
 def canonicalize_cards_with_map(cards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -283,6 +284,9 @@ class PokerTransformerPolicyNet(nn.Module):
             nn.GELU(),
             nn.Linear(self.d_model, 1),
         )
+        # Training-only auxiliary head predicting canonicalized opponent hole cards from the
+        # decentralized actor latent so the actor learns implicit Bayesian range reading.
+        self.opp_card_head = nn.Linear(self.d_model, constants.NUM_CARDS)
 
     def _load_from_state_dict(
         self,
@@ -295,7 +299,7 @@ class PokerTransformerPolicyNet(nn.Module):
         error_msgs: list[str],
     ) -> None:
         # Remap legacy nn.TransformerEncoder keys (`encoder.layers.*`) and fill newly added
-        # CTDE cross-attention keys so pre-SDPA checkpoints load cleanly.
+        # training-only CTDE/auxiliary head keys so older checkpoints load cleanly.
         legacy_prefix = f"{prefix}encoder.layers."
         remapped = False
         for k in list(state_dict.keys()):
@@ -312,8 +316,8 @@ class PokerTransformerPolicyNet(nn.Module):
                     new_rest = rest
                 state_dict[f"{prefix}blocks.layers.{new_rest}"] = state_dict.pop(k)
 
+        own = self.state_dict()
         if remapped:
-            own = self.state_dict()
             for suffix in (
                 "omni_norm_q.weight",
                 "omni_norm_q.bias",
@@ -327,6 +331,10 @@ class PokerTransformerPolicyNet(nn.Module):
                 full_k = f"{prefix}{suffix}"
                 if full_k not in state_dict and suffix in own:
                     state_dict[full_k] = own[suffix].clone()
+        for suffix in ("opp_card_head.weight", "opp_card_head.bias"):
+            full_k = f"{prefix}{suffix}"
+            if full_k not in state_dict and suffix in own:
+                state_dict[full_k] = own[suffix].clone()
 
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
@@ -504,6 +512,27 @@ class PokerTransformerPolicyNet(nn.Module):
         omni_val = self.omniscient_value_head(omni_in).squeeze(-1)
         return omni_val, dec_val
 
+    def _compute_opp_card_loss(
+        self,
+        latent: torch.Tensor,
+        canon_map: torch.Tensor,
+        opp_cards: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if opp_cards is None:
+            return None
+        opp_canon = apply_suit_map(opp_cards, canon_map)
+        valid_rows = (opp_canon[:, 0] >= 0) & (opp_canon[:, 1] >= 0)
+        if not valid_rows.any():
+            return None
+        logits = self.opp_card_head(latent[valid_rows]).to(dtype=torch.float32)
+        c0 = opp_canon[valid_rows, 0].clamp(min=0, max=constants.NUM_CARDS - 1)
+        c1 = opp_canon[valid_rows, 1].clamp(min=0, max=constants.NUM_CARDS - 1)
+        target = torch.zeros_like(logits)
+        row_idx = torch.arange(logits.shape[0], device=logits.device)
+        target[row_idx, c0] = 1.0
+        target[row_idx, c1] = 1.0
+        return fn.binary_cross_entropy_with_logits(logits, target)
+
     def _forward_latent(
         self,
         *,
@@ -626,15 +655,22 @@ class PokerTransformerPolicyNet(nn.Module):
     ) -> PolicyOutput:
         tokens, lengths, is_packed = self._coerce_input_state(h, c)
 
-        act_dist, raise_dist, value, dec_value, tokens2, lengths2 = self._forward_latent(
-            cards=cards,
-            scalars=scalars,
-            action_mask=action_mask,
-            tokens=tokens,
-            lengths=lengths,
-            terminated=terminated,
-            opp_cards=opp_cards,
+        if terminated is not None:
+            reset = terminated.to(dtype=torch.bool)
+            if reset.any():
+                mask = reset.view(-1, 1, 1).expand_as(tokens)
+                tokens = torch.where(mask, torch.zeros_like(tokens), tokens)
+                lengths = torch.where(reset, torch.zeros_like(lengths), lengths)
+
+        latent, card_out, card_pad, canon_map = self._encode_with_cards(
+            cards=cards, scalars=scalars, tokens=tokens, lengths=lengths
         )
+        masked_logits = self._masked_action_logits(self.action_head(latent), action_mask)
+        act_dist = Categorical(logits=masked_logits)
+        raise_dist = Categorical(logits=self.raise_head(latent).to(dtype=torch.float32))
+        value, dec_value = self._compute_values(latent, card_out, card_pad, canon_map, opp_cards)
+        opp_card_loss = self._compute_opp_card_loss(latent, canon_map, opp_cards)
+        tokens2, lengths2 = tokens, lengths
 
         action_type_i64 = action_type.to(dtype=torch.int64)
         action_logprob = act_dist.log_prob(action_type_i64)
@@ -669,6 +705,7 @@ class PokerTransformerPolicyNet(nn.Module):
             h=h_out,
             c=c_out,
             decentralized_value=dec_value,
+            opp_card_loss=opp_card_loss,
         )
 
 

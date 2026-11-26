@@ -1,0 +1,110 @@
+# Regularized Nash Dynamics v3: 11.3M suit-canonical Card-Token Transformer
+# with CTDE omniscient critic + auxiliary Bayesian opponent hand-reading head
+# and deep-stack (100-200 BB) specialization.
+# Run with: uv run python train/train.py --config-name=train_rnad_v3
+
+device: cuda:0
+num_envs: 65536
+rollout_steps: 32
+starting_stack: 20000
+starting_stack_min: 10000
+starting_stack_max: 20000
+small_blind: 50
+big_blind: 100
+total_env_steps: 6000000000
+num_updates: 0
+
+lr: 2.5e-4
+lr_end: 2.5e-5
+gamma: 1.0
+gae_lambda: 0.95
+clip_eps: 0.2
+value_coef: 0.5
+entropy_coef: 0.005
+entropy_coef_end: 0.001
+max_grad_norm: 1.0
+
+policy_backbone: transformer
+transformer_d_model: 384
+transformer_n_heads: 6
+transformer_n_layers: 6
+transformer_ffn_dim: 1536
+
+card_embed_dim: 64
+mlp_dim: 256
+torso_layers: 2
+lstm_hidden: 256
+head_layers: 0
+head_dim: null
+
+num_epochs: 2
+minibatch_size: 8192
+seed: 42
+log_every_env_steps: 2097152
+log_every_seconds: 1.0
+
+checkpoint_dir: checkpoints/rnad_v3
+save_every_env_steps: 209715200
+resume_from: ""
+
+eval_every: 50
+eval_hands: 10000
+eval_max_steps: 5000000
+
+league_enabled: false
+league_eta_selfplay: 1.0
+league_bot_initial_score: 0.0
+league_eval_bots: false
+league_eval_bots_every: 100
+league_snapshot_pool: 0
+league_snapshot_every_updates: 0
+league_eval_every_updates: 0
+league_eval_hands: 0
+league_eval_subset: 0
+league_eval_deterministic: false
+league_eval_seat_swap: true
+league_pfsp_temperature: 1.0
+league_pfsp_epsilon: 1.0e-3
+league_pfsp_mode: hard
+league_pfsp_q: 2.0
+league_train_on_bots: false
+league_rollout_snapshot_k: 0
+
+selfplay_eval_enabled: false
+selfplay_eval_every_updates: 0
+selfplay_eval_hands: 0
+selfplay_eval_subset: 0
+selfplay_eval_deterministic: false
+selfplay_eval_seat_swap: true
+
+timing_sync: true
+compile_policy: true
+use_amp: true
+amp_dtype: auto
+autotune: false
+use_cuda_graph: false
+
+# R-NaD + CTDE omniscient critic + auxiliary Bayesian opponent hand-reading head
+rnad_enabled: true
+rnad_eta: 0.02
+rnad_reg_update_every: 40
+rnad_kl_clip: 10.0
+use_omniscient_critic: true
+aux_opp_card_coef: 0.5
+
+mlflow_enabled: false
+mlflow_experiment: null
+mlflow_run_name: null
+mlflow_tags:
+  - rnad_v3
+  - transformer
+  - aux_opp
+mlflow_notes: null
+mlflow_extra_tags: null
+mlflow_upload_checkpoints: none
+
+hydra:
+  run:
+    dir: train/outputs/rnad_v3/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true

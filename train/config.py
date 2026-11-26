@@ -118,6 +118,7 @@ class TrainConfig:
     rnad_reg_update_every: int = 40
     rnad_kl_clip: float = 10.0
     use_omniscient_critic: bool = True
+    aux_opp_card_coef: float = 0.0
     lr_end: float | None = None
     entropy_coef_end: float | None = None
 

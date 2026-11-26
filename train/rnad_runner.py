@@ -421,6 +421,7 @@ def _run_impl_rnad(cfg: TrainConfig) -> TrainResult:
         kl_sum = torch.zeros((), device=device, dtype=torch.float32)
         clip_sum = torch.zeros((), device=device, dtype=torch.float32)
         ev_sum = torch.zeros((), device=device, dtype=torch.float32)
+        aux_opp_sum = torch.zeros((), device=device, dtype=torch.float32)
         mb_count = 0
 
         for _epoch in range(int(cfg.num_epochs)):
@@ -477,6 +478,10 @@ def _run_impl_rnad(cfg: TrainConfig) -> TrainResult:
                         + float(cfg.value_coef) * value_loss
                         - cur_ent_coef * entropy_bonus
                     )
+                    aux_opp_val = torch.zeros((), device=device, dtype=torch.float32)
+                    if float(cfg.aux_opp_card_coef) > 0.0 and eval_out.opp_card_loss is not None:
+                        aux_opp_val = eval_out.opp_card_loss
+                        loss = loss + float(cfg.aux_opp_card_coef) * aux_opp_val
 
                 with torch.no_grad():
                     y = returns_f[idx]
@@ -507,6 +512,7 @@ def _run_impl_rnad(cfg: TrainConfig) -> TrainResult:
                 kl_sum = kl_sum + approx_kl.detach()
                 clip_sum = clip_sum + clipfrac.detach()
                 ev_sum = ev_sum + ev.detach()
+                aux_opp_sum = aux_opp_sum + aux_opp_val.detach()
                 mb_count += 1
                 opt_steps += 1
 
@@ -520,6 +526,7 @@ def _run_impl_rnad(cfg: TrainConfig) -> TrainResult:
             "clipfrac": float((clip_sum / denom).item()),
             "explained_variance": float((ev_sum / denom).item()),
             "rnad_reg_kl": reg_kl_mean,
+            "aux_opp_bce": float((aux_opp_sum / denom).item()),
         }
         t_ppo = _t_now() - t_ppo_start
 
@@ -610,10 +617,15 @@ def _run_impl_rnad(cfg: TrainConfig) -> TrainResult:
         mlf.log_metrics(mlf_run, mlf_payload, step=env_steps)
 
         if update % max(1, cfg.log_every_env_steps // max(1, env_steps_per_rollout)) == 0:
+            aux_str = (
+                f" aux_opp={last_metrics['aux_opp_bce']:.4f}"
+                if float(cfg.aux_opp_card_coef) > 0.0
+                else ""
+            )
             print(
                 f"[rnad upd {update:>5}] env={env_steps:>10} sps={sps_now:>7.0f} "
                 f"ev={last_metrics['explained_variance']:+.3f} "
-                f"ent={last_metrics['entropy']:.3f} kl_reg={reg_kl_mean:+.4f} "
+                f"ent={last_metrics['entropy']:.3f} kl_reg={reg_kl_mean:+.4f}{aux_str} "
                 f"reg#={reg_updates} (roll={t_rollout:.2f}s ret={t_ret:.2f}s ppo={t_ppo:.2f}s)",
                 flush=True,
             )
